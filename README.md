@@ -29,5 +29,81 @@ Branch → PR → merge (no direct pushes to `main`); every non-draft PR carries
 checklist sections (Summary / Test plan / Related PRs) and is gated by `pf-pr-review`.
 Develop and demo each capability against the E5 simulator before the hardware gate.
 
-> Status: scaffolding. Application source lands via E6 child beads `tsp-fr2n.1` (skeleton) onward.
-> Licensing: TBD (owner to confirm the org convention before first release).
+## C1 skeleton (this bead — `tsp-fr2n.1`)
+
+The current source is the **descriptor-wiring skeleton**: `src/main.c` opens a
+software-render off-screen framebuffer, connects the E2 runtime via
+`pf_connect_descriptor()`, reads the sim's descriptor-computed `layout.txt`,
+renders **one stub rect per control group** (a133 gets 12 groups; a523 gets 13 —
+Home is the delta, entirely from the descriptor), and speaks the E5 sim's
+`ready` / `snap <ppm>` / `quit` FIFO protocol.
+
+The **body renderers** (button-light, slider-with-marker, hat cross, stick
+calibration box, tilt-bubble, LED grid) land on top of this skeleton in
+`tsp-fr2n.2` (C2) onward — the widget switch in `render_stub_widget()` is the
+single seam they replace.
+
+### Grep-clean promise
+
+The source names ZERO per-device evdev symbol (no `BTN_*` / `KEY_*` / `ABS_*`)
+and ZERO per-device string (no `qmi8658` / `pwm-vibrator` / `sunxi_led` / etc.).
+Every code, every rect, every widget kind enters through `layout.txt`, which is
+derived from `capabilities.toml`. The only ABI constants baked in are the three
+generic evdev event-type numbers (`SYN=0` / `KEY=1` / `ABS=3`).
+
+## Build (`./build.sh`)
+
+Reproducible aarch64 cross-build, driven from pinned refs in [`pins.env`](pins.env):
+
+1. Clone `runtime` (E2) + `sim` (E5) at their pinned commits (cached under
+   `.cache/`).
+2. Cross-build `libpocketforge.a` for `aarch64-unknown-linux-gnu` inside a stock
+   `rust:1.77-bookworm` container (staticlib output from the ABI-frozen v1
+   crate).
+3. Cross-build the sim's `sdl3-render` static `libSDL3.a` for aarch64 inside a
+   `debian:bookworm` toolchain container (matches the same recipe the sim's
+   `hwprobe-lite.c` builds against — video + software renderer on, all GPU /
+   X11 / Wayland / audio backends off).
+4. Cross-compile `build/pf-hwprobe.arm64` via `aarch64-linux-gnu-gcc`, static-
+   linking both archives (the [`Makefile`](Makefile) is the compile step).
+
+Run host: **modelmaker** (`mm@10.0.40.90`; per the epic ruling this bead is
+device-free). The build takes ~5–10 min cold and ~30 s warm.
+
+## Verify (device-free, under the E5 sim)
+
+Once built, drive the SAME binary against BOTH descriptors — the a133/a523 delta
+comes purely from the loaded `capabilities.toml`:
+
+```sh
+./ci/run-under-sim.py \
+    --device a133 \
+    --binary   ./build/pf-hwprobe.arm64 \
+    --sim      ./.cache/sim \
+    --platform ./.cache/platform \
+    --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
+    --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \
+    --outdir   ./evidence/a133
+# ... and again with --device a523 --outdir ./evidence/a523
+```
+
+The wrapper stages `platform/devices/<id>/capabilities.toml` into `--outdir`
+before the sim harness bwrap-binds it as `/out`, so the app finds the descriptor
+at `/out/capabilities.toml` and passes it to `pf_connect_descriptor()`. Evidence
+lands under `evidence/<device>/frames/*.{ppm,png}`.
+
+### Grep test (part of acceptance)
+
+```sh
+grep -REn 'BTN_|KEY_|ABS_[A-Z]|qmi8658|mmc5603|pwm-vibrator|sunxi_led|ledc|KEY_HOMEPAGE' src/ include/ 2>/dev/null || echo "clean"
+```
+
+Expected: `clean`. (Bare `EV_KEY=1` / `EV_ABS=3` / `EV_SYN=0` are generic
+kernel-ABI type numbers and are named as local enum members
+(`EV_TYPE_KEY` / `EV_TYPE_ABS` / `EV_TYPE_SYN`), not the underscored
+per-device symbols the grep pattern looks for.)
+
+## Licensing
+
+MIT — matches the sibling `runtime`, `sim`, and `platform` repos. See
+[`LICENSE`](LICENSE).
