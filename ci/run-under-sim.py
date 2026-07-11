@@ -65,6 +65,33 @@ def stage_descriptor(platform_dir: Path, device_id: str, outdir: Path) -> Path:
     return dst
 
 
+def stage_skin(platform_dir: Path, device_id: str, outdir: Path) -> None:
+    """Stage the descriptor's skin PNGs (``skin.body`` + ``skin.lit_body``) into
+    ``outdir`` preserving their descriptor-relative paths, so the app resolves them at
+    ``<io-dir>/<skin.body>`` under the bwrap ``/out`` bind (the harness binds ``outdir``
+    only, not the platform ``skins/`` tree). C2 (tsp-fr2n.2) render dependency. Plain
+    file copies of the platform's real PNGs — never re-authored or converted."""
+    try:
+        import tomllib  # py3.11+
+        _load = lambda p: tomllib.load(open(p, "rb"))  # noqa: E731
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore
+        _load = lambda p: tomllib.load(open(p, "rb"))  # noqa: E731
+    desc = _load(platform_dir / "devices" / device_id / "capabilities.toml")
+    skin = desc.get("skin", {})
+    rels = [skin.get("body"), skin.get("lit_body")]
+    for rel in rels:
+        if not rel:
+            continue
+        src = platform_dir / rel
+        if not src.is_file():
+            raise SystemExit(f"[run-under-sim] skin asset missing: {src}")
+        dst = outdir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        print(f"[run-under-sim] staged skin {rel}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -87,6 +114,7 @@ def main() -> int:
 
     Device, _ = _import_sim(args.sim)
     stage_descriptor(args.platform, args.device, args.outdir)
+    stage_skin(args.platform, args.device, args.outdir)
 
     dev = Device(args.device, str(args.platform),
                  launcher="qemu", outdir=str(args.outdir),

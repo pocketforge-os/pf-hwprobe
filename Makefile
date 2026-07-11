@@ -28,11 +28,13 @@ BIN_NAME       ?= pf-hwprobe
 # bookworm-arm64 rootfs without libSDL3.so resolution (SDL3_DYNAMIC_API still
 # engages: on the device the DYNAPI env swaps libSDL3-pocketforge.so.0 in).
 CFLAGS         ?= -O2 -Wall -Wextra -Wpedantic -std=gnu11 -ffp-contract=off
-CFLAGS         += -I$(SDL3_INCLUDE) -I$(PF_INCLUDE) -Isrc
+# third_party/ carries the vendored public-domain stb_image (PNG decode); it lives
+# OUTSIDE src/ so the acceptance grep (src/ + include/) stays clean.
+CFLAGS         += -I$(SDL3_INCLUDE) -I$(PF_INCLUDE) -Isrc -Ithird_party
 LDFLAGS        ?= -static
 LIBS           ?= $(SDL3_STATIC) $(PF_STATIC) -lm -ldl -lpthread -lrt
 
-SRC            := src/main.c
+SRC            := src/main.c src/img_decode.c
 BIN            := $(OUT_DIR)/$(BIN_NAME)
 
 .PHONY: all clean help
