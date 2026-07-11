@@ -56,6 +56,7 @@
 #include <pocketforge.h>
 
 #include "img_decode.h"
+#include "widget_actuators.h"     /* C6 (tsp-fr2n.6): rumble handle + LED-grid widget */
 
 #include <ctype.h>
 #include <dirent.h>
@@ -148,6 +149,10 @@ struct app {
     int             have_skin;               /* both textures + fit ready */
 
     PfSession      *session;                 /* E2 handle; may be NULL if no descriptor */
+
+    /* Actuator descriptor state (C6 / tsp-fr2n.6): the a133/a523 delta for the LED
+     * count + rumble presence enters here as PURE DATA — no per-device code. */
+    struct actuator_state actuators;
 };
 
 /* ------------------------------------------------------------------ evidence log */
@@ -660,6 +665,11 @@ static void render_frame(SDL_Renderer *r, const struct app *app) {
             render_stub_widget(r, &app->controls[i]);
         }
     }
+    /* C6: LED-grid widget — cells reflect the descriptor `[[actuators]]` count
+     * (a133 = 23, a523 = 17; the per-device controller IC is descriptor data the
+     * app never names). Rendered on top of the body/lit pass so it's visible
+     * whether or not the skin loaded. */
+    widget_led_grid_render(r, &app->actuators, app->canvas_w, app->canvas_h);
     SDL_RenderPresent(r);
 }
 
@@ -802,6 +812,12 @@ int main(int argc, char **argv) {
     if (parse_layout(&app, layout_p) != 0) return 3;
     parse_skin(&app, io_dir);
     resolve_skin_rects(&app);
+    /* C6: parse [[actuators]] rows from the SAME descriptor for the LED count + rumble
+     * presence. Missing rows leave app.actuators zeroed (a133's honest omission path). */
+    actuators_parse_descriptor(&app.actuators, io_dir);
+    log_line("pf-hwprobe: actuators: rumble=%s leds.count=%d",
+             app.actuators.has_rumble ? "present" : "absent",
+             app.actuators.led_count);
 
     /* SDL video: dummy driver — no window system needed under the sim. */
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
@@ -836,6 +852,17 @@ int main(int argc, char **argv) {
     acquire_input(&app);
     load_skin(&app, r, io_dir);
 
+    /* C6: exercise the FIRST OUTPUT CAPABILITY through the facade at startup, so the
+     * descriptor-derived rumble shape shows up in the transcript on every run. The app
+     * makes ONE unconditional pf_rumble_pulse() call — the primitive maps descriptor
+     * presence + the `hapticsEnabled` preference to the three-way status. There is NO
+     * app-side check of the preference (that would double-implement the E4 gate). */
+    if (app.session) {
+        int rst = pf_rumble_pulse(app.session, 40);
+        log_line("pf-hwprobe: rumble startup pulse(40ms) -> %s (PF_RUMBLE=%d)",
+                 actuators_rumble_status_name(rst), rst);
+    }
+
     /* FIFO handshake — O_RDWR so open never blocks; the host owns the peer end. */
     int req_fd  = open(req_p,  O_RDWR);
     int resp_fd = open(resp_p, O_RDWR);
@@ -863,6 +890,19 @@ int main(int argc, char **argv) {
             render_frame(r, &app);
             dump_ppm_from_argb(fb_mem, rgb_scratch, app.canvas_w, app.canvas_h, path);
             fifo_reply(resp_fd, "ok");
+        } else if (!strncmp(line, "rumble", 6)) {
+            /* C6 (tsp-fr2n.6): host-driven pulse through the C ABI. Same three-way
+             * status the sim's Python broker_stub returns from `dev.acquire_rumble()
+             * .pulse(...)` — verified by ci/c6-verify.py in both directions. */
+            const char *arg = line + 6;
+            while (*arg == ' ') arg++;
+            uint32_t ms = (uint32_t)atoi(*arg ? arg : "40");
+            if (app.session) {
+                int rst = pf_rumble_pulse(app.session, ms);
+                fifo_reply(resp_fd, actuators_rumble_status_name(rst));
+            } else {
+                fifo_reply(resp_fd, "err");
+            }
         } else if (!strncmp(line, "quit", 4)) {
             fifo_reply(resp_fd, "bye");
             break;
