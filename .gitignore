@@ -1,0 +1,26 @@
+# Build outputs
+/build/
+/target/
+*.o
+*.a
+*.so
+*.so.*
+*.out
+pf-hwprobe
+pf-hwprobe-*
+
+# Rust
+/Cargo.lock.orig
+**/*.rs.bk
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local test artifacts (sim framebuffer dumps, captures)
+*.ppm
+*.png.tmp
+/captures/
+/sim-out/
