@@ -1,0 +1,136 @@
+# pf-hwprobe/tests/fixtures/platform-synth/devices/synth_imu/capabilities.toml
+#
+# SYNTHETIC test descriptor for C5 (tsp-fr2n.5) — NOT a real device.
+#
+# WHY THIS EXISTS: NEITHER shipping descriptor (a133, a523) carries a [[sensors]] row —
+# the a133 has no IMU and the a523 qmi8658 is DT-present but driver-UNBOUND per SPIKE-0
+# (tsp-9sx.1). infra-105's "A523 ONLY" line is stale. The tilt-bubble is therefore the
+# OMISSION path on BOTH shipping devices. We PROVE the sensor→bubble LOGIC against this
+# synthetic descriptor via the E5 sim's virtual IIO (sim/sensor/iio_synth.py). Both
+# shipping descriptors then prove the omission path — SAME BINARY, ZERO source-change.
+#
+# HONESTY: this descriptor is NOT a real device. It sits under tests/fixtures/ (NOT
+# platform/devices/) precisely so it does not pretend otherwise; a "platform-synth"
+# lookalike so run-under-sim.py / control_surface.Device consume it transparently. When
+# a real a523 kernel/DT lands the qmi8658 driver, the a523's real descriptor gains an
+# [[sensors]] row — a DATA change that lights this same widget with zero app-code change,
+# per the epic invariant (tsp-fr2n acceptance).
+
+accept_default = "south"
+
+[identity]
+id           = "synth_imu"
+manufacturer = "PocketForge"
+model        = "Synthetic IMU Fixture"
+codename     = "test"
+sdl_guid     = "030000005e0400008e02000010010000"   # borrows the Xbox-360 GUID (test-only)
+match        = { evdev_name = "PF Synth IMU", vid = "045e", pid = "028e" }
+
+[[screens]]
+role          = "primary"
+present       = "landscape"
+rotation      = "none"
+render_canvas = { w = 1280, h = 720 }
+display_rect  = { x = 0, y = 0, w = 1280, h = 720 }
+
+# --- INPUTS ---
+# The four face buttons — enough distinct skin_parts to let main.c's recover_fit
+# solve the skin-space -> canvas-space transform (needs >=2 rects with both a
+# layout.txt entry AND a [skin.parts] entry). We reuse a133's face arrangement so
+# the fit works identically to a shipping descriptor. Everything else the sim
+# expects (sticks/triggers/hat) is deliberately omitted — the fixture is about
+# the SENSOR path, not the input matrix.
+[[inputs]]
+id = "south"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_A"
+label = "A"
+skin_part = "btn_south"
+[[inputs]]
+id = "east"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_B"
+label = "B"
+skin_part = "btn_east"
+[[inputs]]
+id = "west"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_X"
+label = "X"
+skin_part = "btn_west"
+[[inputs]]
+id = "north"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_Y"
+label = "Y"
+skin_part = "btn_north"
+
+# D-pad + two sticks — reused from a133's positions so the layout fit's bounding box
+# spans a wide area of the skin. Without these, the fit shrinks to the tight face-button
+# cluster and any imu skin-rect outside that cluster maps off-canvas. See the fixture's
+# top comment: this file exists to prove the sensor path, so the input rows are the
+# minimum set needed to give layout.py enough spread for a realistic fit.
+[[inputs]]
+id = "dpad"
+kind = "hat"
+ev_type = "EV_ABS"
+code = "ABS_HAT0X,ABS_HAT0Y"
+skin_part = "dpad"
+[[inputs]]
+id = "lstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_X,ABS_Y"
+x = { min = -32768, max = 32767 }
+y = { min = -32768, max = 32767 }
+skin_part = "stick_l"
+[[inputs]]
+id = "rstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_RX,ABS_RY"
+x = { min = -32768, max = 32767 }
+y = { min = -32768, max = 32767 }
+skin_part = "stick_r"
+
+# --- SENSORS ---
+# THE FIXTURE'S ENTIRE POINT: an [[sensors]] row with a NON-IDENTITY mount_matrix.
+# Under the E5 sim (iio_synth.IIOSynth): the descriptor's mount_matrix is used to
+# INVERSE-mount the physical model's device-frame reading into a chip-frame raw, then
+# written to /sys/bus/iio/devices/iio:device0/in_accel_*_raw + in_accel_scale. The app
+# then reads the chip-frame raws, multiplies by scale, and re-applies THIS matrix to
+# recover the device frame. If the app were to skip the mount_matrix step, its reply
+# would come back rotated 90° — the check-imu.py assertion notices and fails. So this
+# fixture PROVES the app CONSUMES the descriptor's mount_matrix (read, never hard-coded).
+#
+# The matrix is a 90° rotation about Z (Yaw) — device.x = -chip.y, device.y = chip.x —
+# deliberately non-symmetric so a missed application is visible in the reply.
+[[sensors]]
+id           = "imu"
+kind         = "accel+gyro"
+iio_device   = "qmi8658"
+ui           = "tilt_bubble"
+mount_matrix = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
+
+# --- SKIN ---
+# We reuse the a133 body art (copied INTO this fixture at ../../skins/synth_imu/*.png)
+# so the fit/render code paths are exercised identically to a real descriptor. The
+# [skin.parts].imu rect is what tells the app WHERE on the canvas to draw the tilt
+# bubble — NEITHER shipping descriptor has such a row, so both render the omission.
+[skin]
+body     = "skins/synth_imu/body.png"
+lit_body = "skins/synth_imu/body_lit.png"
+
+[skin.parts]
+dpad      = { x = 92,   y = 140, w = 116, h = 116 }
+stick_l   = { x = 95,   y = 382, w = 116, h = 116 }
+stick_r   = { x = 1272, y = 382, w = 116, h = 116 }
+btn_south = { x = 1306, y = 224, w = 48,  h = 48  }
+btn_east  = { x = 1356, y = 176, w = 48,  h = 48  }
+btn_west  = { x = 1256, y = 176, w = 48,  h = 48  }
+btn_north = { x = 1306, y = 128, w = 48,  h = 48  }
+imu       = { x = 560,  y = 130, w = 170, h = 170 }
