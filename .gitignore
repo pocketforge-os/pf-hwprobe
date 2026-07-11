@@ -24,3 +24,5 @@ pf-hwprobe-*
 *.png.tmp
 /captures/
 /sim-out/
+/evidence/
+/.cache/
