@@ -58,6 +58,8 @@
 #include "img_decode.h"
 #include "widget_actuators.h"   /* C6 (tsp-fr2n.6): rumble handle + LED-grid widget */
 #include "sensor_imu.h"         /* C5 (tsp-fr2n.5): sensor + tilt-bubble widget */
+#include "widget_stick.h"       /* C4 (tsp-fr2n.4): sticks — directional dot */
+#include "widget_hat.h"         /* C4 (tsp-fr2n.4): dpad — 8-way segment highlight */
 
 #include <ctype.h>
 #include <dirent.h>
@@ -409,6 +411,39 @@ static double trigger_fraction(const struct control *c) {
     return f;
 }
 
+/* ------------------------------------------------------------------ C4: stick/hat axes
+ *
+ * Normalize the (x-role, y-role) binding pair of a kind=stick or kind=hat control to
+ * (nx, ny) in [-1, 1] using EACH BINDING'S own vmin/vmax from layout.txt (the descriptor
+ * axis range, per-device). A binding whose role is not 'x'/'y' is ignored; a control with
+ * only one axis leaves the other at 0 (sticks always ship pairs, but the code stays honest
+ * if a future descriptor row declares a single-axis passive input). Data-bound: the
+ * per-device evdev code numbers live only in the descriptor + layout.txt, never here. */
+static void stick_axis_values(const struct control *c, double *out_nx, double *out_ny) {
+    double nx = 0.0, ny = 0.0;
+    for (int j = 0; j < c->n_bindings; j++) {
+        const struct binding *b = &c->bindings[j];
+        if (b->type != EV_TYPE_ABS || b->vmax == b->vmin) continue;
+        /* Map [vmin, vmax] -> [-1, 1] via the endpoints, not a stored centre — honest for
+         * any axis range in the descriptor (including asymmetric ones a future device may
+         * carry). Clamped in the widget itself. */
+        double n = ((double)(b->value - b->vmin) / (double)(b->vmax - b->vmin)) * 2.0 - 1.0;
+        if      (b->role == 'x') nx = n;
+        else if (b->role == 'y') ny = n;
+    }
+    *out_nx = nx;
+    *out_ny = ny;
+}
+
+/* Ternarize a normalized axis fraction (-1..1) into a hat direction (-1, 0, 1). The
+ * 25% threshold matches control_is_active's stick/hat deadzone — a hat that reads
+ * "active" always resolves to a non-zero direction, and vice versa. */
+static int hat_direction(double n) {
+    if (n >  0.25) return  1;
+    if (n < -0.25) return -1;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ input capability acquisition seam
  *
  * CAPABILITY MODEL (the epic invariant): the app obtains input THROUGH the E2 facade,
@@ -667,6 +702,23 @@ static void render_frame(SDL_Renderer *r, struct app *app) {
             SDL_SetRenderDrawColor(r, 214, 64, 64, ACTIVE_TINT_A);
             SDL_RenderFillRect(r, &dst);
             SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+            /* C4: layer a directional widget over the wash. The wash keeps the rect
+             * centre RED (E7 stick/hat "deflect -> is_red at centre" holds); the widget
+             * paints a bright yellow marker on the deflection direction — a stick DOT
+             * at (nx, ny), a hat SEGMENT at (hx, hy) — so the snapshot captures WHICH
+             * quadrant / octant is active. Yellow (255,220,40) fails is_red (g > 90),
+             * so even a widget-over-centre pixel never spoofs the E7 predicate. Drawn
+             * only when active, in lockstep with the wash, so rest states stay dark. */
+            if (c->kind == WK_STICK) {
+                double nx = 0.0, ny = 0.0;
+                stick_axis_values(c, &nx, &ny);
+                widget_stick_render_dot(r, c->x, c->y, c->w, c->h, nx, ny);
+            } else if (c->kind == WK_HAT) {
+                double nx = 0.0, ny = 0.0;
+                stick_axis_values(c, &nx, &ny);
+                widget_hat_render_segment(r, c->x, c->y, c->w, c->h,
+                                          hat_direction(nx), hat_direction(ny));
+            }
         }
     } else {
         for (int i = 0; i < app->n_controls; i++) {
