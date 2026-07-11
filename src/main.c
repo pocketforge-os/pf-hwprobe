@@ -56,7 +56,8 @@
 #include <pocketforge.h>
 
 #include "img_decode.h"
-#include "widget_actuators.h"     /* C6 (tsp-fr2n.6): rumble handle + LED-grid widget */
+#include "widget_actuators.h"   /* C6 (tsp-fr2n.6): rumble handle + LED-grid widget */
+#include "sensor_imu.h"         /* C5 (tsp-fr2n.5): sensor + tilt-bubble widget */
 
 #include <ctype.h>
 #include <dirent.h>
@@ -153,6 +154,10 @@ struct app {
     /* Actuator descriptor state (C6 / tsp-fr2n.6): the a133/a523 delta for the LED
      * count + rumble presence enters here as PURE DATA — no per-device code. */
     struct actuator_state actuators;
+
+    /* C5 (tsp-fr2n.5): the sensor path. Populated when the descriptor carries an
+     * [[sensors]] accel/gyro row; otherwise the honest omission (no crash, no bubble). */
+    struct sensor_imu imu;
 };
 
 /* ------------------------------------------------------------------ evidence log */
@@ -625,7 +630,10 @@ static void load_skin(struct app *app, SDL_Renderer *r, const char *io_dir) {
  * lights buttons, the a523 Home key, and the a523 L3/R3 stick-clicks straight from
  * descriptor rows with ZERO per-device code. (C3/C4 layer proportional trigger + directional
  * stick/hat widgets on top of this foundation.) */
-static void render_frame(SDL_Renderer *r, const struct app *app) {
+/* C5 (tsp-fr2n.5) note: ``app`` is no longer const on the render path — the tilt-bubble
+ * refreshes the IIO reading before drawing (mutates ``imu.last_*``). Everything else
+ * this function touches is still logically read-only. */
+static void render_frame(SDL_Renderer *r, struct app *app) {
     fill_rect(r, 0, 0, app->canvas_w, app->canvas_h, 24, 24, 24);
     if (app->have_skin) {
         SDL_FRect body_dst = {
@@ -670,6 +678,11 @@ static void render_frame(SDL_Renderer *r, const struct app *app) {
      * app never names). Rendered on top of the body/lit pass so it's visible
      * whether or not the skin loaded. */
     widget_led_grid_render(r, &app->actuators, app->canvas_w, app->canvas_h);
+    /* C5 (tsp-fr2n.5): the tilt-bubble widget. Refreshes the IIO tree first so the dot
+     * tracks the pose the sim just injected. A no-op when the descriptor advertises no
+     * accel/gyro sensor OR carries no matching [skin.parts] rect — the omission path
+     * both shipping descriptors currently take. */
+    sensor_imu_render(r, &app->imu);
     SDL_RenderPresent(r);
 }
 
@@ -863,6 +876,33 @@ int main(int argc, char **argv) {
                  actuators_rumble_status_name(rst), rst);
     }
 
+    /* C5 (tsp-fr2n.5): SENSOR path. Parse [[sensors]] out of the same descriptor, route
+     * the acquire through the E2 facade (pf_acquire("imu")), then resolve the tilt-bubble
+     * canvas rect from [skin.parts].<sensor.id> using the same fit the body uses. On a
+     * descriptor with no accel/gyro row (BOTH shipping devices today) every step here is
+     * a typed no-op — the honest omission the epic's four-way taxonomy calls for. */
+    sensor_imu_init(&app.imu);
+    {
+        char desc_p[PATH_BUF];
+        snprintf(desc_p, sizeof desc_p, "%s/capabilities.toml", io_dir);
+        sensor_imu_parse_from_descriptor(&app.imu, desc_p);
+    }
+    sensor_imu_acquire_from_facade(&app.imu, app.session);
+    if (app.have_skin && app.imu.present) {
+        struct pf_imu_skin_part_view *view =
+            calloc((size_t)app.n_skin_parts, sizeof *view);
+        if (view) {
+            for (int i = 0; i < app.n_skin_parts; i++) {
+                view[i].name = app.skin_parts[i].name;
+                view[i].x = app.skin_parts[i].x; view[i].y = app.skin_parts[i].y;
+                view[i].w = app.skin_parts[i].w; view[i].h = app.skin_parts[i].h;
+            }
+            sensor_imu_resolve_skin_rect(&app.imu, view, app.n_skin_parts,
+                                         app.fit_s, app.fit_ox, app.fit_oy);
+            free(view);
+        }
+    }
+
     /* FIFO handshake — O_RDWR so open never blocks; the host owns the peer end. */
     int req_fd  = open(req_p,  O_RDWR);
     int resp_fd = open(resp_p, O_RDWR);
@@ -903,11 +943,18 @@ int main(int argc, char **argv) {
             } else {
                 fifo_reply(resp_fd, "err");
             }
+        } else if (!strncmp(line, "imu", 3) && (line[3] == '\0' || line[3] == ' ')) {
+            /* C5 (tsp-fr2n.5): the sensor read verb. sensor_imu_reply_verb() refreshes
+             * the IIO tree and writes either "imu-absent" (no descriptor row, no
+             * facade authorization, or the read chain failed) or the milli-SI reply
+             * "imu <name> ax ay az gx gy gz" that control_surface.Device.read_imu
+             * parses byte-for-byte. */
+            sensor_imu_reply_verb(&app.imu, resp_fd);
         } else if (!strncmp(line, "quit", 4)) {
             fifo_reply(resp_fd, "bye");
             break;
         } else if (line[0]) {
-            /* Unknown verb (e.g. "imu" — arrives with C5). Reply "err" per contract. */
+            /* Unknown verb. Reply "err" per the sim's FIFO contract. */
             fifo_reply(resp_fd, "err");
         }
     }
