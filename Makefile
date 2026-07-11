@@ -34,7 +34,7 @@ CFLAGS         += -I$(SDL3_INCLUDE) -I$(PF_INCLUDE) -Isrc -Ithird_party
 LDFLAGS        ?= -static
 LIBS           ?= $(SDL3_STATIC) $(PF_STATIC) -lm -ldl -lpthread -lrt
 
-SRC            := src/main.c src/img_decode.c src/widget_actuators.c src/sensor_imu.c src/widget_stick.c src/widget_hat.c
+SRC            := src/main.c src/img_decode.c src/widget_actuators.c src/sensor_imu.c src/widget_stick.c src/widget_hat.c src/widget_trigger.c
 BIN            := $(OUT_DIR)/$(BIN_NAME)
 
 .PHONY: all clean help
