@@ -1,0 +1,110 @@
+name: hwprobe-smoke
+
+# pf-hwprobe headless CI smoke gate (bead tsp-fr2n.7 / wires infra-106 E7).
+#
+# Runs the SAME descriptor-generic matrix E5's sim-gate.yml runs against
+# hwprobe-lite (the reference payload), but with pf-hwprobe.arm64 as the app
+# under test. Two descriptors (a133, a523) = two matrix rows with ZERO
+# app/test-code difference — the a133/a523 delta is DATA (E1's
+# capabilities.toml), same source, same binary.
+#
+# ADVISORY first: this workflow is NOT a required status check, so a red run
+# does not block merge. Same posture as the E5 sim-gate — flip to BLOCKING by
+# adding this job to main's branch-protection required checks once a133+a523
+# stay green + stable across enough PRs (E5/E7 owner decision: advisory ->
+# blocking).
+#
+# WHY qemu-launcher ONLY (for now):
+#   pf-hwprobe's build.sh currently cross-builds ONLY aarch64. Sim's
+#   check-control.py's parity check needs a matching x86 native build to
+#   compare bit-for-bit against qemu. Until pf-hwprobe grows an x86 build
+#   step, --only-launcher qemu drives just the arm64/qemu leg (loudly, not
+#   silently — the transcript prints "parity SKIPPED"). Adding x86 is a
+#   straightforward follow-up (mirror the arm64 recipe with
+#   x86_64-linux-gnu-gcc + x86 SDL3 build); tracked in ci/check-control-
+#   hwprobe.py's module docstring.
+#
+# SECURITY POSTURE — identical to E5 sim-gate.yml (self-hosted docker with
+# elevated caps for qemu-tsp + uinput + bwrap). The equivalent hardenings
+# apply here:
+#   * Least-privilege GITHUB_TOKEN (contents: read).
+#   * --network none on the RUN phase (baked, pinned artifacts).
+#   * Fork/outside-contributor PRs are gated by the org actions approval.
+#
+# RUNNER NOTE (follow-up for the coordinator): the self-hosted org runner
+# `trimui-build-lab` lives in a runner group whose repo allow-list currently
+# covers {sim, kernel-tsp, infra}. Adding pocketforge-os/pf-hwprobe to that
+# allow-list is a one-time coordinator/owner action; until then this workflow
+# skips on other runners with a clear message so the required-check story
+# stays honest (advisory red on the wrong runner is still red).
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hwprobe-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hwprobe-smoke:
+    runs-on: [self-hosted, docker]
+    timeout-minutes: 60
+    env:
+      SIM_IMG: pocketforge-sim:hwprobe-smoke-${{ github.run_id }}
+      # sim commit that sim-gate.yml also builds against; kept in step with
+      # pf-hwprobe's build.sh SIM_COMMIT so the sim's control_surface + the
+      # check-control matrix + the qemu-tsp + rootfs all come from ONE ref.
+      SIM_REPO: https://github.com/pocketforge-os/sim.git
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Ensure uinput module (the nested sim expects the host node)
+        run: sudo modprobe uinput || true
+
+      - name: Cross-build pf-hwprobe.arm64 (pinned; hermetic docker)
+        run: ./build.sh
+
+      - name: Assert arm64 ELF built
+        run: |
+          file build/pf-hwprobe.arm64 | tee /tmp/pf-hwprobe.file
+          grep -q 'ELF 64-bit LSB executable, ARM aarch64' /tmp/pf-hwprobe.file
+
+      - name: Resolve pinned sim commit from pf-hwprobe pins.env
+        id: sim
+        run: |
+          # shellcheck disable=SC1091
+          . ./pins.env
+          echo "sim_commit=${SIM_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "resolved sim commit: ${SIM_COMMIT}"
+
+      - name: Clone the sim @ pinned commit
+        run: |
+          rm -rf .cache/sim-clone
+          git clone --quiet "$SIM_REPO" .cache/sim-clone
+          git -C .cache/sim-clone -c advice.detachedHead=false checkout --quiet "${{ steps.sim.outputs.sim_commit }}"
+
+      - name: Build the sim's pocketforge-sim image (baked qemu-tsp + rootfs + platform + hwprobe-lite)
+        run: |
+          docker build -t "$SIM_IMG" .cache/sim-clone
+
+      # --network none on the RUN: baked, pinned artifacts, no out-of-band input needed.
+      # The elevated caps mirror E5 sim-gate.yml — SYS_ADMIN + unconfined apparmor/seccomp
+      # are required by the nested bwrap sandbox + uinput/evdev seam. See docker/README.md
+      # in the sim repo for the tsp-qc1.2 verdict on the required cap set.
+      - name: check-control matrix a133 a523 (pf-hwprobe.arm64, qemu launcher only)
+        run: |
+          docker run --rm --network none \
+            --device /dev/uinput --device-cgroup-rule "c 13:* rmw" -v /dev/input:/dev/input \
+            --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
+            -v "$PWD/build:/pf-hwprobe-build:ro" \
+            -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \
+            "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe a133 a523
+
+      - name: Cleanup CI image
+        if: always()
+        run: docker image rm -f "$SIM_IMG" || true

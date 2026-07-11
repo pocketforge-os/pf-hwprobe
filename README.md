@@ -72,8 +72,10 @@ device-free). The build takes ~5–10 min cold and ~30 s warm.
 
 ## Verify (device-free, under the E5 sim)
 
-Once built, drive the SAME binary against BOTH descriptors — the a133/a523 delta
-comes purely from the loaded `capabilities.toml`:
+### Rest-state boot proof (`ci/run-under-sim.py`)
+
+The C1 skeleton's proof: drive the SAME binary against BOTH descriptors — the
+a133/a523 delta comes purely from the loaded `capabilities.toml`:
 
 ```sh
 ./ci/run-under-sim.py \
@@ -91,6 +93,41 @@ The wrapper stages `platform/devices/<id>/capabilities.toml` into `--outdir`
 before the sim harness bwrap-binds it as `/out`, so the app finds the descriptor
 at `/out/capabilities.toml` and passes it to `pf_connect_descriptor()`. Evidence
 lands under `evidence/<device>/frames/*.{ppm,png}`.
+
+### Full descriptor-driven matrix (`ci/check-control-hwprobe.py`, C7)
+
+The E7 CI smoke gate — drives the honest, descriptor-generic regression matrix
+from `sim/control/check-control.py` against pf-hwprobe (NOT the reference
+`hwprobe-lite`). For BOTH descriptors, with ZERO app/test-code difference:
+
+* every `[[inputs]]` row: inject the event → assert the control lit
+  (`Region.is_red()`);
+* every trigger: sweep `min..max` → assert the marker tracks (`Slider.at(f)`);
+* every ABSENT control (a133 home/l3/r3; both-device IMU): assert typed
+  `hardware-absent`, NEVER a crash;
+* framebuffer → PPM → deterministic sampling is the authoritative readback
+  (per the `tsp-visual-inspection` hallucination caveat); the reviewer script
+  `ci/screen-reviewer-readback.py` is a complementary text-only visual check.
+
+```sh
+./ci/check-control-hwprobe.py \
+    --binary   ./build/pf-hwprobe.arm64 \
+    --sim      ./.cache/sim \
+    --platform ./.cache/platform \
+    --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
+    --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \
+    --outdir   ./evidence/matrix
+```
+
+Exit 0 = matrix PASS on every requested descriptor. Native-vs-qemu byte
+parity is SKIPPED for now — pf-hwprobe currently only cross-builds arm64; the
+transcript prints `parity SKIPPED` rather than faking a green tick (adding an
+x86 build step to `build.sh` restores the parity leg).
+
+The matching CI caller is `.github/workflows/hwprobe-smoke.yml`. It builds
+pf-hwprobe.arm64, builds the sim's pinned `pocketforge-sim` container, then
+runs the matrix inside it with `pf-hwprobe.arm64` bound at `APP_ARM64`.
+Advisory-first (same posture as `pocketforge-os/sim`'s `sim-gate.yml`).
 
 ### Grep test (part of acceptance)
 
