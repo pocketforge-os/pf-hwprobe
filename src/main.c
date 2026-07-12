@@ -60,6 +60,7 @@
 #include "sensor_imu.h"         /* C5 (tsp-fr2n.5): sensor + tilt-bubble widget */
 #include "widget_stick.h"       /* C4 (tsp-fr2n.4): sticks — directional dot */
 #include "widget_hat.h"         /* C4 (tsp-fr2n.4): dpad — 8-way segment highlight */
+#include "widget_trigger.h"     /* C3 (tsp-fr2n.3): triggers — slider-with-marker */
 
 #include <ctype.h>
 #include <dirent.h>
@@ -119,6 +120,11 @@ struct control {
     int              sx, sy, sw, sh;   /* skin-image-space rect ([skin.parts]; 0 => none) */
     int              n_bindings;
     struct binding   bindings[MAX_BINDINGS];
+    /* Actuator semantics (schema `semantics`, tsp-v19s, 2026-07-11). 1 => binary
+     * (endpoint-only 0<->255 on real hw); 0 => analog / unspecified. Consumed
+     * by the C3 trigger widget for honest presentation of binary-on-analog
+     * inputs (L2/R2 on both TrimUI devices). Data-bound, no per-device code. */
+    int              sem_binary;
 };
 
 /* A named rect from the descriptor's [skin.parts] table (skin-image pixel space). */
@@ -283,6 +289,36 @@ static void strip_quotes(char *s) {
     }
 }
 
+/* Small pending-input state used inside parse_skin to accumulate a single
+ * [[inputs]] row and flush it once the section boundary or file end is hit. */
+struct pending_input {
+    char skin_part[MAX_NAME];
+    char kind[MAX_NAME];
+    int  sem_binary;   /* set when `semantics = "binary"` is seen inside the row */
+    int  valid;        /* set by entry into an [[inputs]] section */
+};
+
+/* Flush one [[inputs]] row into per-control state:
+ *   - `semantics = "binary"` on a kind=trigger row marks the matching control
+ *     (by skin_part) as binary. See widget_trigger for how the flag is presented.
+ * This is a targeted read of ONE field from the descriptor — nothing here parses
+ * the row as a general TOML value. */
+static void flush_pending_input(struct app *app, struct pending_input *pi) {
+    if (!pi->valid) return;
+    if (pi->skin_part[0] && !strcmp(pi->kind, "trigger") && pi->sem_binary) {
+        for (int i = 0; i < app->n_controls; i++) {
+            if (!strcmp(app->controls[i].name, pi->skin_part)) {
+                app->controls[i].sem_binary = 1;
+                log_line("pf-hwprobe: trigger '%s' semantics=binary "
+                         "(endpoint-only 0<->255 on real hw per tsp-v19s)",
+                         pi->skin_part);
+                break;
+            }
+        }
+    }
+    memset(pi, 0, sizeof *pi);
+}
+
 static int parse_skin(struct app *app, const char *io_dir) {
     char path[PATH_BUF];
     snprintf(path, sizeof path, "%s/capabilities.toml", io_dir);
@@ -291,7 +327,9 @@ static int parse_skin(struct app *app, const char *io_dir) {
         log_line("pf-hwprobe: skin parse: no descriptor at %s (%s)", path, strerror(errno));
         return -1;
     }
-    enum { SEC_OTHER, SEC_SKIN, SEC_PARTS } sec = SEC_OTHER;
+    enum { SEC_OTHER, SEC_SKIN, SEC_PARTS, SEC_INPUT } sec = SEC_OTHER;
+    struct pending_input pi;
+    memset(&pi, 0, sizeof pi);
     char line[1024];
     while (fgets(line, sizeof line, f)) {
         /* left-trim */
@@ -300,9 +338,14 @@ static int parse_skin(struct app *app, const char *io_dir) {
         if (*p == '#' || *p == '\n' || *p == '\0') continue;
 
         if (*p == '[') {
-            if (!strncmp(p, "[skin.parts]", 12))      sec = SEC_PARTS;
-            else if (!strncmp(p, "[skin]", 6))         sec = SEC_SKIN;
-            else                                        sec = SEC_OTHER;
+            /* Any section boundary flushes the current [[inputs]] row (if one is
+             * pending) BEFORE re-classifying — so a subsequent [[inputs]] block
+             * starts clean and the last row still flushes at EOF. */
+            flush_pending_input(app, &pi);
+            if (!strncmp(p, "[skin.parts]", 12))     sec = SEC_PARTS;
+            else if (!strncmp(p, "[skin]", 6))       sec = SEC_SKIN;
+            else if (!strncmp(p, "[[inputs]]", 10)) { sec = SEC_INPUT; pi.valid = 1; }
+            else                                       sec = SEC_OTHER;
             continue;
         }
         if (sec == SEC_SKIN) {
@@ -323,8 +366,26 @@ static int parse_skin(struct app *app, const char *io_dir) {
                 snprintf(sp->name, sizeof sp->name, "%s", name);
                 sp->x = x; sp->y = y; sp->w = w; sp->h = h;
             }
+        } else if (sec == SEC_INPUT) {
+            /* Targeted: only capture the two fields the widget consumes. Every
+             * other [[inputs]] field (id, code, ev_type, range, etc.) is already
+             * carried via layout.txt — no need to re-parse it here. */
+            char key[MAX_NAME], val[PATH_BUF];
+            if (sscanf(p, "%39s = \"%511[^\"]\"", key, val) == 2) {
+                /* All three fields hold a short identifier / enum literal; the
+                 * `%.39s` precision bounds the snprintf source to MAX_NAME-1 so
+                 * the fortify-source truncation warning stays quiet without
+                 * changing behavior (sscanf already caps `key` at 39). */
+                if (!strcmp(key, "skin_part"))       snprintf(pi.skin_part, MAX_NAME, "%.39s", val);
+                else if (!strcmp(key, "kind"))       snprintf(pi.kind,      MAX_NAME, "%.39s", val);
+                else if (!strcmp(key, "semantics") && !strcmp(val, "binary"))
+                    pi.sem_binary = 1;
+            }
         }
     }
+    /* Flush the last [[inputs]] row (nothing follows to trigger the section-
+     * boundary flush above). Same read-merge idiom as any TOML row-parser. */
+    flush_pending_input(app, &pi);
     fclose(f);
     log_line("pf-hwprobe: skin parsed: body='%s' lit='%s' parts=%d",
              app->skin_body, app->skin_lit, app->n_skin_parts);
@@ -541,9 +602,15 @@ static void fill_rect(SDL_Renderer *r, int x, int y, int w, int h,
  * with no staged assets) so the app still renders + the binding still proves out. */
 static void render_stub_widget(SDL_Renderer *r, const struct control *c) {
     if (c->kind == WK_TRIGGER) {
+        /* Track background under the widget's proportional fill — kept here (not
+         * in widget_trigger) so the skin-run path composites the descriptor's
+         * lit_body sprite over the actual body PNG without a grey wash. */
         fill_rect(r, c->x, c->y, c->w, c->h, 70, 70, 70);
-        int fw = (int)((double)c->w * trigger_fraction(c) + 0.5);
-        if (fw > 0) fill_rect(r, c->x, c->y, fw, c->h, 220, 30, 30);
+        wt_trigger_render(r, /*tex_lit=*/NULL,
+                          c->x, c->y, c->w, c->h,
+                          c->sx, c->sy, c->sw, c->sh,
+                          trigger_fraction(c),
+                          c->sem_binary);
         return;
     }
     int on = control_is_active(c);
@@ -680,17 +747,16 @@ static void render_frame(SDL_Renderer *r, struct app *app) {
             const struct control *c = &app->controls[i];
             if (c->sw <= 0 || c->sh <= 0) continue;
             if (c->kind == WK_TRIGGER) {
-                /* Triggers render PROPORTIONALLY: the lit strip fills left-to-right to the
-                 * axis fraction, so the E7 slider assertion (fraction ≈ value, monotonic)
-                 * holds. C3 layers the slider-with-marker refinement on top. */
-                double f = trigger_fraction(c);
-                if (f <= 0.001) continue;
-                float fw_src = (float)(c->sw * f);
-                float fw_dst = (float)(c->w  * f);
-                if (fw_dst < 1.0f) continue;
-                SDL_FRect src = { (float)c->sx, (float)c->sy, fw_src, (float)c->sh };
-                SDL_FRect dst = { (float)c->x,  (float)c->y,  fw_dst, (float)c->h  };
-                SDL_RenderTexture(r, app->tex_lit, &src, &dst);
+                /* C3: proportional lit strip PLUS a slider marker drawn ABOVE the
+                 * trig rect (ui="slider_above"). Widget is data-bound to the
+                 * descriptor's axis range (via trigger_fraction) and its
+                 * `semantics` field (via c->sem_binary; tsp-v19s). See
+                 * widget_trigger.h for the two-part rendering contract. */
+                wt_trigger_render(r, app->tex_lit,
+                                  c->x, c->y, c->w, c->h,
+                                  c->sx, c->sy, c->sw, c->sh,
+                                  trigger_fraction(c),
+                                  c->sem_binary);
                 continue;
             }
             if (!control_is_active(c)) continue;
