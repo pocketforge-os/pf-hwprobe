@@ -9,9 +9,10 @@
 #      hwprobe-lite build in sim/Dockerfile: VIDEO+RENDER on, GPU/wayland/x11 off).
 #   4. Cross-compile pf-hwprobe.arm64 (Makefile), statically linking both.
 #
-# Outputs land in ./build/. No global tool installs required beyond `docker` and
-# the standard aarch64-linux-gnu cross-gcc (or docker containers for those too if
-# you set BUILD_MODE=docker-only). Reproducibility caveats: the SDL3 build resolves
+# Outputs land in ./build/. No global tool installs required beyond `docker` —
+# the final C cross-compile uses the host aarch64-linux-gnu cross-gcc when
+# present (fast dev path) and falls back to a debian:bookworm container when
+# not (e.g. the build-lab CI runner). Reproducibility caveats: the SDL3 build resolves
 # `apt install cmake ninja-build` from live bookworm suite — same residual gap the
 # sim's own Dockerfile calls out; hardened when we snapshot-pin bookworm.
 #
@@ -136,14 +137,43 @@ fi
 
 # ------------------------------------------------------------------ 4. pf-hwprobe.arm64
 banner "cross-compile pf-hwprobe (aarch64-linux-gnu-gcc)"
-export CC=aarch64-linux-gnu-gcc
-export SDL3_INCLUDE="$SDL3_INC"
-export PF_INCLUDE="$DEPS_DIR/include"
-export SDL3_STATIC="$SDL3_A"
-export PF_STATIC="$LIBPF_A"
-export OUT_DIR="$BUILD_DIR"
-export BIN_NAME="pf-hwprobe.arm64"
-make -f Makefile all
+if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+    # Native fast path — the host has the cross-gcc (typical dev machine).
+    export CC=aarch64-linux-gnu-gcc
+    export SDL3_INCLUDE="$SDL3_INC"
+    export PF_INCLUDE="$DEPS_DIR/include"
+    export SDL3_STATIC="$SDL3_A"
+    export PF_STATIC="$LIBPF_A"
+    export OUT_DIR="$BUILD_DIR"
+    export BIN_NAME="pf-hwprobe.arm64"
+    make -f Makefile all
+else
+    # Container fallback (bead tsp-u3e4): the build-lab runner host has no
+    # cross-gcc — the smoke job died here (`make: aarch64-linux-gnu-gcc: No
+    # such file or directory`) the first time checkout ever got past the
+    # workdir wedge. Same hermetic pattern as steps 2/3, same live-bookworm
+    # apt caveat, same ownership hand-back so nothing root-owned lands in the
+    # workdir. The double mount keeps an overridden BUILD_DIR working: the
+    # container always sees the build tree at /work/build.
+    docker run --rm \
+        -v "$HERE":/work -w /work \
+        -v "$BUILD_DIR":/work/build \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        debian:bookworm bash -euxc '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends \
+                make file gcc-aarch64-linux-gnu libc6-dev-arm64-cross >/dev/null
+            export CC=aarch64-linux-gnu-gcc
+            export SDL3_INCLUDE=/work/build/deps/sdl3-include
+            export PF_INCLUDE=/work/build/deps/include
+            export SDL3_STATIC=/work/build/deps/libSDL3.a
+            export PF_STATIC=/work/build/deps/libpocketforge.a
+            export OUT_DIR=/work/build
+            export BIN_NAME=pf-hwprobe.arm64
+            make -f Makefile all
+            chown -R "$HOST_UID:$HOST_GID" /work/build
+        '
+fi
 file "$BUILD_DIR/pf-hwprobe.arm64"
 
 banner "build ok"
