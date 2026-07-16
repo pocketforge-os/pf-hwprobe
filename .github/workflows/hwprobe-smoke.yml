@@ -41,6 +41,11 @@ name: hwprobe-smoke
 on:
   pull_request:
     branches: [main]
+  # Baseline signal on main (bead tsp-u3e4): one smoke run per merge is cheap on
+  # the self-hosted runner and gives main a green/red history instead of
+  # PR-only signal — a prerequisite for ever flipping advisory -> blocking.
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -108,3 +113,15 @@ jobs:
       - name: Cleanup CI image
         if: always()
         run: docker image rm -f "$SIM_IMG" || true
+
+      # Defense-in-depth vs root-owned leftovers (bead tsp-u3e4): build.sh's
+      # containers now chown their outputs back to the invoking user, but if a
+      # build dies mid-container (or a future step regresses), root-owned files
+      # in the workspace wedge the NEXT run's actions/checkout (EACCES rmdir —
+      # exactly how every smoke run 2026-07-12..16 went red). The runner user
+      # has no general sudo, so reclaim ownership via docker instead. Never
+      # fails the job: it's a sweep, not a gate.
+      - name: Reclaim workspace ownership (prevent runner-workdir wedge)
+        if: always()
+        run: |
+          docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true

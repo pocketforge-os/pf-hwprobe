@@ -69,10 +69,16 @@ clone_pin "$PLATFORM_REPO" "$PLATFORM_COMMIT" "$PLATFORM_SRC" > "$BUILD_DIR/plat
 LIBPF_A="$DEPS_DIR/libpocketforge.a"
 if [ ! -f "$LIBPF_A" ] || [ "$force_refetch" = 1 ]; then
     banner "cross-build libpocketforge.a (aarch64-unknown-linux-gnu, staticlib)"
+    # HOST_UID/HOST_GID + the final chown: the container runs as root (apt/rustup
+    # need it), so anything it writes to /out lands root-owned on the HOST bind
+    # mount — which wedged the build-lab runner workdir (actions/checkout EACCES
+    # rmdir on stale root-owned deps, bead tsp-u3e4). Hand ownership back before
+    # the container exits so ./build.sh never leaves files its caller can't delete.
     docker run --rm \
         -v "$RUNTIME_SRC":/src:ro \
         -v "$DEPS_DIR":/out \
         -e CARGO_HOME=/tmp/cargo \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         "$RUST_IMAGE" bash -euxc '
             mkdir -p /work && cp -a /src/. /work/
             cd /work
@@ -87,6 +93,7 @@ EOF
             cargo build --release -p libpocketforge --target aarch64-unknown-linux-gnu
             cp target/aarch64-unknown-linux-gnu/release/libpocketforge.a /out/libpocketforge.a
             aarch64-linux-gnu-nm --defined-only /out/libpocketforge.a | grep -E "\\bT pf_" | wc -l
+            chown -R "$HOST_UID:$HOST_GID" /out
         '
     echo "libpocketforge.a: $(file "$LIBPF_A")"
 fi
@@ -103,10 +110,13 @@ if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
     # Reuse the sim's build-sdl3-render.sh — it clones the pinned SDL3, configures
     # video+render+software with every GPU backend off, produces libSDL3.a. We run
     # it in the toolchain container so apt/cmake/cross-gcc are hermetic.
+    # Same ownership hand-back as the rust container above (bead tsp-u3e4):
+    # /out is a host bind mount and this container runs as root.
     docker run --rm \
         -v "$SIM_SRC":/sim:ro \
         -v "$DEPS_DIR":/out \
         -w /work \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         debian:bookworm bash -euxc '
             apt-get update -qq
             apt-get install -y -qq --no-install-recommends \
@@ -119,6 +129,7 @@ if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
             cp /work/sdl3-render/arm64/lib/libSDL3.a /out/libSDL3.a
             mkdir -p /out/sdl3-include
             cp -a /work/sdl3-render/arm64/include/. /out/sdl3-include/
+            chown -R "$HOST_UID:$HOST_GID" /out
         '
     echo "libSDL3.a: $(file "$SDL3_A")"
 fi
