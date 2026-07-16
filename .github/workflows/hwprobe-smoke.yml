@@ -68,8 +68,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
-      - name: Ensure uinput module (the nested sim expects the host node)
-        run: sudo modprobe uinput || true
+      # uinput note: the nested sim needs the HOST's /dev/uinput (passed into the
+      # container below). The runner user has no modprobe sudo, so a workflow-side
+      # `sudo modprobe uinput` can never work — the module is guaranteed host-side
+      # via /etc/modules-load.d/uinput.conf, provisioned by pocketforge-automation
+      # scripts/provision-build-host.sh (bead tsp-y1c6). No workflow step needed.
 
       - name: Cross-build pf-hwprobe.arm64 (pinned; hermetic docker)
         run: ./build.sh
