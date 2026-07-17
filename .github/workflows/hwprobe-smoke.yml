@@ -29,14 +29,19 @@ name: hwprobe-smoke
 # apply here:
 #   * Least-privilege GITHUB_TOKEN (contents: read).
 #   * --network none on the RUN phase (baked, pinned artifacts).
-#   * Fork/outside-contributor PRs are gated by the org actions approval.
+#   * MECHANICAL fork guard (tsp-20u1, build-lab confinement invariant): the
+#     job-level `if:` skips the job for any PR whose head repo is not this
+#     repository, so even a maintainer-APPROVED fork PR never executes on the
+#     runner. The org approval gate (fork-pr-contributor-approval =
+#     all_external_contributors) stays as defense-in-depth beneath it.
+#     Canonical doc: mission-control BUILD_PIPELINE.md "Build-lab confinement
+#     invariant".
 #
-# RUNNER NOTE (follow-up for the coordinator): the self-hosted org runner
-# `trimui-build-lab` lives in a runner group whose repo allow-list currently
-# covers {sim, kernel-tsp, infra}. Adding pocketforge-os/pf-hwprobe to that
-# allow-list is a one-time coordinator/owner action; until then this workflow
-# skips on other runners with a clear message so the required-check story
-# stays honest (advisory red on the wrong runner is still red).
+# RUNNER NOTE: the self-hosted org runner `trimui-build-lab` lives in the
+# `build-lab` runner group (visibility=selected), repo allow-list {sim,
+# pf-hwprobe, infra, kernel-tsp (archived, inert)} — audited tsp-20u1.
+# pf-hwprobe was added to the allow-list (the pre-tsp-20u1 note here said it
+# was pending); group membership changes are owner/org-admin actions.
 
 on:
   pull_request:
@@ -57,6 +62,12 @@ concurrency:
 
 jobs:
   hwprobe-smoke:
+    # Build-lab confinement invariant (tsp-20u1): this self-hosted runner has
+    # docker = host root and must NEVER execute fork/public-PR code — skip the
+    # job whenever the PR head is not this repository, so even an APPROVED
+    # fork PR never runs here. push/workflow_dispatch are unaffected (org-
+    # authored by construction). Advisory check, so a skip blocks nobody.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, docker]
     timeout-minutes: 60
     env:
