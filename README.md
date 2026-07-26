@@ -110,8 +110,8 @@ a133/a523 delta comes purely from the loaded `capabilities.toml`:
     --binary   ./build/pf-hwprobe.arm64 \
     --sim      ./.cache/sim \
     --platform ./.cache/platform \
-    --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
-    --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \
+    --qemu-tsp $HOME/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
+    --rootfs   $HOME/sim-build/harness/rootfs-arm64 \
     --outdir   ./evidence/a133
 # ... and again with --device a523 --outdir ./evidence/a523
 ```
@@ -141,8 +141,8 @@ from `sim/control/check-control.py` against pf-hwprobe (NOT the reference
     --binary   ./build/pf-hwprobe.arm64 \
     --sim      ./.cache/sim \
     --platform ./.cache/platform \
-    --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
-    --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \
+    --qemu-tsp $HOME/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
+    --rootfs   $HOME/sim-build/harness/rootfs-arm64 \
     --outdir   ./evidence/matrix
 ```
 
