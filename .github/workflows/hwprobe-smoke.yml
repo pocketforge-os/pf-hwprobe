@@ -17,7 +17,11 @@ name: hwprobe-smoke
 #
 # ═══════════ GATE SCOPE · HONESTY CONTRACT · POSTURE · FORK-SKIP (infra-113 B1) ═══════════
 # WHAT THIS GATE PROVES — the LOGICAL layer ONLY (canonical: sim/docs/HONESTY-CONTRACT.md;
-# restated in every gate's docs per infra-113 §4). It runs the SAME descriptor-generic
+# restated in every gate's docs per infra-113 §4).
+# ADD A DEVICE = ADD DATA — this gate's device rows + posture come from platform/ci-matrix.toml;
+# adding a device is a pure data change (descriptor + .scad skin + posture row), NOT a workflow
+# edit. Cold-start walkthrough: sim/docs/ADD-A-DEVICE.md.
+# It runs the SAME descriptor-generic
 # check-control matrix the sim-gate runs, with pf-hwprobe.arm64 as the app under test:
 # descriptor correctness, input mapping (evdev codes → SDL3), capability/permission
 # semantics, graceful missing-hardware degradation, and per-variant coverage (a133 vs
