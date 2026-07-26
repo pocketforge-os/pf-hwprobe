@@ -8,12 +8,12 @@ name: hwprobe-smoke
 # app/test-code difference — the a133/a523 delta is DATA (E1's
 # capabilities.toml), same source, same binary.
 #
-# ADVISORY first: this workflow is NOT a required status check, so a red run
-# does not block merge. Same posture as the E5 sim-gate — flip to BLOCKING by
-# adding this job to main's branch-protection required checks — the a133 row is
-# the blocking key (a523 runs non-blocking, infra-113 D2 descope). See the
-# "GATE SCOPE / POSTURE / FORK-SKIP" block below for the full contract before
-# relying on this gate.
+# BLOCKING (infra-113 B2, flipped 2026-07-26): this `hwprobe-smoke` job is now a REQUIRED
+# status check on main — a red run BLOCKS merge. Same posture as the E5 sim-gate. The a133
+# row is the blocking key (a523 runs non-blocking, infra-113 D2 descope). Required via the
+# repo-level ruleset `pf-hwprobe-smoke required check` (id 19755681), scoped to this repo's
+# default branch only (NOT the org-wide pf-pr-review ruleset). See the "GATE SCOPE / POSTURE
+# / FORK-SKIP" block below for the full contract before relying on this gate.
 #
 # ═══════════ GATE SCOPE · HONESTY CONTRACT · POSTURE · FORK-SKIP (infra-113 B1) ═══════════
 # WHAT THIS GATE PROVES — the LOGICAL layer ONLY (canonical: sim/docs/HONESTY-CONTRACT.md;
@@ -40,18 +40,24 @@ name: hwprobe-smoke
 #   pf-hwprobe's build.sh cross-builds arm64 only — so it proves the arm64/qemu leg only,
 #   loudly, not silently. See "WHY qemu-launcher ONLY" below; tracked in tsp-78ta item 3.)
 #
-# POSTURE (infra-113 D3/D4) — ADVISORY TODAY: this is NOT yet a required status check, so a
-# red run does not block merge. Treat a red advisory run as a real failure anyway — fix it,
-# do not merge past it (infra-113 §7). Phase B2 FLIPS this to BLOCKING (adds this job to
-# main's branch-protection required checks) once the a133 row is current + stable; a133 is
-# the blocking key, a523 runs non-blocking (D2). A negative control — descriptor-row
-# deletion → red — is demonstrated before the flip (infra-113 B1).
+# POSTURE (infra-113 D3/D4) — BLOCKING as of 2026-07-26 (Phase B2 flip): this job IS a
+# required status check on main, so a red run BLOCKS merge. a133 is the blocking key; a523
+# runs non-blocking (D2 — a523 rides as device-free data, not a hardware gate). The flip was
+# gated on currency (D3): A1 refreshed the sim/platform baselines, A2 refreshed this repo's
+# coherent sim+platform pin pair (smoke green all devices), and a negative control —
+# descriptor-row deletion → red — was demonstrated first (infra-113 B1; hwprobe-smoke run
+# 30186739722 conclusion=failure). Required via the repo-level ruleset `pf-hwprobe-smoke
+# required check` (id 19755681, default-branch only), which carries an OrgAdmin `always`
+# bypass (owner break-glass for a runner outage / flake — mirrors the pf-pr-review
+# check-ruleset; grants no direct-push path, pf-require-pr stays bypass-free). It does NOT
+# touch the org-wide pf-pr-review ruleset (18463042) — this check is scoped to this repo only.
 #
 # FORK-SKIP SEMANTICS (infra-113 finding 10 / D4 — stated plainly): the job-level fork guard
 # below makes this job SKIP for any PR whose head repo is not this repository. GitHub treats
-# a SKIPPED required check as SATISFIED — so once B2 makes this a required check, a fork PR's
-# skip counts as a pass and this gate does NOT actually gate fork PRs. That is an accepted,
-# conscious decision: the build-lab confinement invariant (tsp-20u1) forbids executing
+# a SKIPPED required check as SATISFIED — so now that B2 has made this a required check
+# (2026-07-26), a fork PR's skip counts as a pass and this gate does NOT actually gate fork
+# PRs. That is an accepted, conscious decision (finding 10 / D4, ACCEPTED at the B2 flip):
+# the build-lab confinement invariant (tsp-20u1) forbids executing
 # fork/public-PR code on this self-hosted docker = host-root runner, so a fork PR cannot run
 # the suite here by design. Fork contributions are validated by an org member re-pushing the
 # change to an in-repo branch (which DOES run the gate) before merge.
