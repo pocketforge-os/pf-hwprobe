@@ -10,9 +10,52 @@ name: hwprobe-smoke
 #
 # ADVISORY first: this workflow is NOT a required status check, so a red run
 # does not block merge. Same posture as the E5 sim-gate — flip to BLOCKING by
-# adding this job to main's branch-protection required checks once a133+a523
-# stay green + stable across enough PRs (E5/E7 owner decision: advisory ->
-# blocking).
+# adding this job to main's branch-protection required checks — the a133 row is
+# the blocking key (a523 runs non-blocking, infra-113 D2 descope). See the
+# "GATE SCOPE / POSTURE / FORK-SKIP" block below for the full contract before
+# relying on this gate.
+#
+# ═══════════ GATE SCOPE · HONESTY CONTRACT · POSTURE · FORK-SKIP (infra-113 B1) ═══════════
+# WHAT THIS GATE PROVES — the LOGICAL layer ONLY (canonical: sim/docs/HONESTY-CONTRACT.md;
+# restated in every gate's docs per infra-113 §4). It runs the SAME descriptor-generic
+# check-control matrix the sim-gate runs, with pf-hwprobe.arm64 as the app under test:
+# descriptor correctness, input mapping (evdev codes → SDL3), capability/permission
+# semantics, graceful missing-hardware degradation, and per-variant coverage (a133 vs
+# a523 = data, not code) — cheaply, off-hardware, in CI.
+#
+# WHAT IT IS **NOT** HONEST ABOUT — these FIVE things are NOT proven here and a green run
+# MUST NOT be read as covering them; they stay the flash → serial → webcam HARDWARE gate's
+# SOLE authority (the two gates are complementary, never substitutes):
+#   1. GPU blobs — the closed PowerVR UM/KM and the dc_sunxi → DE2.0 → fb0 path are not
+#      reproduced; a sim "cube renders" proves NOTHING on-device.
+#   2. Real WiFi flakiness — the XR819/xr829 lossy-link reality (DHCP-up-but-TCP-dead)
+#      cannot be mocked faithfully; network E2E stays on hardware.
+#   3. Timing / perf / thermal — qemu-user timing ≠ A53/A55; no soak, no fan/thermal.
+#   4. Isolation / enforcement — guest seccomp is unenforceable under qemu-user; the sim
+#      proves the capability/permission CONTRACT + ergonomics, NOT that a hostile app is
+#      confined.
+#   5. Per-SoC graphics — divergent display stacks (A133 sunxifb/no-KMS/fb0 vs A523
+#      kmsdrm/Mali/DRM-KMS) are per-SoC code + build, not descriptor data.
+#   (This gate additionally has a KNOWN local gap: the native/qemu PARITY leg is SKIPPED —
+#   pf-hwprobe's build.sh cross-builds arm64 only — so it proves the arm64/qemu leg only,
+#   loudly, not silently. See "WHY qemu-launcher ONLY" below; tracked in tsp-78ta item 3.)
+#
+# POSTURE (infra-113 D3/D4) — ADVISORY TODAY: this is NOT yet a required status check, so a
+# red run does not block merge. Treat a red advisory run as a real failure anyway — fix it,
+# do not merge past it (infra-113 §7). Phase B2 FLIPS this to BLOCKING (adds this job to
+# main's branch-protection required checks) once the a133 row is current + stable; a133 is
+# the blocking key, a523 runs non-blocking (D2). A negative control — descriptor-row
+# deletion → red — is demonstrated before the flip (infra-113 B1).
+#
+# FORK-SKIP SEMANTICS (infra-113 finding 10 / D4 — stated plainly): the job-level fork guard
+# below makes this job SKIP for any PR whose head repo is not this repository. GitHub treats
+# a SKIPPED required check as SATISFIED — so once B2 makes this a required check, a fork PR's
+# skip counts as a pass and this gate does NOT actually gate fork PRs. That is an accepted,
+# conscious decision: the build-lab confinement invariant (tsp-20u1) forbids executing
+# fork/public-PR code on this self-hosted docker = host-root runner, so a fork PR cannot run
+# the suite here by design. Fork contributions are validated by an org member re-pushing the
+# change to an in-repo branch (which DOES run the gate) before merge.
+# ═════════════════════════════════════════════════════════════════════════════════════════
 #
 # WHY qemu-launcher ONLY (for now):
 #   pf-hwprobe's build.sh currently cross-builds ONLY aarch64. Sim's
