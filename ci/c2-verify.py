@@ -19,8 +19,8 @@ the bound event nodes are root-only). Exits non-zero on the first failed asserti
 USAGE (mirrors ci/run-under-sim.py):
     sudo ./ci/c2-verify.py --device a523 \
         --binary ./build/pf-hwprobe.arm64 --sim ./.cache/sim --platform ./.cache/platform \
-        --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
-        --rootfs /home/mm/sim-build/harness/rootfs-arm64 --outdir ./evidence/c2-a523
+        --qemu-tsp $HOME/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
+        --rootfs $HOME/sim-build/harness/rootfs-arm64 --outdir ./evidence/c2-a523
 """
 from __future__ import annotations
 

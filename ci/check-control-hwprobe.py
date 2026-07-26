@@ -44,8 +44,8 @@ USAGE
         --binary   ./build/pf-hwprobe.arm64 \
         --sim      ./.cache/sim \
         --platform ./.cache/platform \
-        --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
-        --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \
+        --qemu-tsp $HOME/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
+        --rootfs   $HOME/sim-build/harness/rootfs-arm64 \
         --outdir   ./evidence/matrix \
         [--devices a133 a523]
 
