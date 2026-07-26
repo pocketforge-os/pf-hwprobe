@@ -107,6 +107,14 @@ jobs:
           git clone --quiet "$SIM_REPO" .cache/sim-clone
           git -C .cache/sim-clone -c advice.detachedHead=false checkout --quiet "${{ steps.sim.outputs.sim_commit }}"
 
+      # ═══ NEGATIVE CONTROL (tsp-65jc.3 / infra-113 B1) — DO NOT MERGE ═══
+      # Break the a133 descriptor in the cloned sim BEFORE building it, so the baked
+      # capabilities.toml loses its "south" [[inputs]] row and check-control's HEADLINE
+      # goes RED — proving hwprobe-smoke gates descriptor-level breakage before the B2
+      # advisory→blocking flip. The RED run URL is the deliverable; this PR closes UNMERGED.
+      - name: "NEG CONTROL: drop a133 south descriptor row in cloned sim (DO NOT MERGE)"
+        run: bash ci/neg-control-break-a133-south.sh .cache/sim-clone
+
       - name: Build the sim's pocketforge-sim image (baked qemu-tsp + rootfs + platform + hwprobe-lite)
         run: |
           docker build -t "$SIM_IMG" .cache/sim-clone
