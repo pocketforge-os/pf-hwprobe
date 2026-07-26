@@ -160,18 +160,69 @@ jobs:
         run: |
           docker build -t "$SIM_IMG" .cache/sim-clone
 
+      # Data-driven device matrix (infra-113 B4 / D6): the device list + per-device posture are
+      # derived from the baked platform's ci-matrix.toml (`pf-sim matrix`), NOT a hardcoded
+      # hardcoded device list — so adding a device to CI is a platform-data change, not an edit here.
+      # a133 is the blocking key (a failure fails this required `hwprobe-smoke` check → merge block);
+      # a523 runs advisory (a failure is reported but does not fail the check); excluded devices
+      # never run. A new descriptor auto-joins as advisory with zero edits here.
+      - name: Derive the data-driven device matrix from the baked platform
+        id: matrix
+        run: |
+          set -euo pipefail
+          # Read the CI gate matrix from the platform descriptors BAKED into the sim image
+          # (ci-matrix.toml, infra-113 B4). We invoke caps.py via the always-present `shell` verb
+          # (this image is built from pins.env's pinned sim, which need not carry the new `matrix`
+          # entrypoint verb) — so the only dependency is the BAKED PLATFORM carrying caps.py's
+          # `matrix` subcommand.
+          caps() { docker run --rm "$SIM_IMG" shell -lc "python3 /opt/pf/platform/core/caps.py $*" 2>/dev/null; }
+          blocking="$(caps matrix list --posture blocking --format ids || true)"
+          advisory="$(caps matrix list --posture advisory --format ids || true)"
+          excluded="$(caps matrix list --posture excluded --format ids || true)"
+          if [ -z "${blocking}${advisory}" ]; then
+            # FAIL-CLOSED fallback: the baked platform predates infra-113 B4 (no ci-matrix.toml /
+            # no `caps matrix`). Derive the device list from platform data anyway — `caps list`
+            # (long-standing) yields the descriptor'd devices — and gate them ALL as blocking (the
+            # pre-B4 behavior), so a stale pin never SILENTLY relaxes a device. Still list-free.
+            blocking="$(caps list | tr '\n' ' ' | sed 's/ *$//')"; advisory=""; excluded=""
+            echo "note: baked platform has no ci-matrix.toml (pin predates infra-113 B4) — all descriptor'd devices treated BLOCKING until the pin catches up"
+          fi
+          echo "blocking (a failure fails hwprobe-smoke): ${blocking:-(none)}"
+          echo "advisory (reported, non-blocking):        ${advisory:-(none)}"
+          echo "excluded (not run):                       ${excluded:-(none)}"
+          echo "blocking=${blocking}" >> "$GITHUB_OUTPUT"
+          echo "advisory=${advisory}" >> "$GITHUB_OUTPUT"
+          [ -n "${blocking}${advisory}" ] || { echo "FATAL: matrix derived zero runnable devices from platform data" >&2; exit 1; }
+
       # --network none on the RUN: baked, pinned artifacts, no out-of-band input needed.
       # The elevated caps mirror E5 sim-gate.yml — SYS_ADMIN + unconfined apparmor/seccomp
       # are required by the nested bwrap sandbox + uinput/evdev seam. See docker/README.md
       # in the sim repo for the tsp-qc1.2 verdict on the required cap set.
-      - name: check-control matrix a133 a523 (pf-hwprobe.arm64, qemu launcher only)
+      - name: check-control (BLOCKING devices; pf-hwprobe.arm64, qemu launcher only)
+        if: steps.matrix.outputs.blocking != ''
         run: |
           docker run --rm --network none \
             --device /dev/uinput --device-cgroup-rule "c 13:* rmw" -v /dev/input:/dev/input \
             --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
             -v "$PWD/build:/pf-hwprobe-build:ro" \
             -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \
-            "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe a133 a523
+            "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.blocking }}
+
+      # ADVISORY devices report but do not fail the required check (infra-113 D2 — a523 rides as
+      # device-free data, not a hardware gate). A failure here is surfaced loudly, never silenced.
+      - name: check-control (ADVISORY devices; reported, non-blocking)
+        if: steps.matrix.outputs.advisory != ''
+        run: |
+          if docker run --rm --network none \
+            --device /dev/uinput --device-cgroup-rule "c 13:* rmw" -v /dev/input:/dev/input \
+            --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
+            -v "$PWD/build:/pf-hwprobe-build:ro" \
+            -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \
+            "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.advisory }}; then
+            echo "✓ advisory devices passed: ${{ steps.matrix.outputs.advisory }}"
+          else
+            echo "::warning title=advisory sim smoke failed::advisory devices FAILED (reported, non-blocking): ${{ steps.matrix.outputs.advisory }}"
+          fi
 
       - name: Cleanup CI image
         if: always()
