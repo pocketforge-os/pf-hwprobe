@@ -90,11 +90,14 @@ name: hwprobe-smoke
 #     Canonical doc: mission-control BUILD_PIPELINE.md "Build-lab confinement
 #     invariant".
 #
-# RUNNER NOTE: the self-hosted org runner `trimui-build-lab` lives in the
-# `build-lab` runner group (visibility=selected), repo allow-list {sim,
-# pf-hwprobe, infra, kernel-tsp (archived, inert)} — audited tsp-20u1.
-# pf-hwprobe was added to the allow-list (the pre-tsp-20u1 note here said it
-# was pending); group membership changes are owner/org-admin actions.
+# RUNNER NOTE: this gate runs on the self-hosted builder VM (org runner
+# `mm-build-vm`, label pf-builder-vm; a KVM guest on modelmaker, OFF the
+# labgrid arbitration host per infra-113 Option B, tsp-65jc.24). It is
+# org-authored-only with the SAME confinement posture as the retired Dell
+# `trimui-build-lab` target — the fork-skip guard above is unchanged.
+# Runner-group membership (the build-lab group today; moving to a dedicated
+# public-repo-scoped `pf-builder` group in the same bead) is an owner/org-
+# admin action.
 
 on:
   pull_request:
@@ -121,7 +124,7 @@ jobs:
     # fork PR never runs here. push/workflow_dispatch are unaffected (org-
     # authored by construction). Advisory check, so a skip blocks nobody.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, docker]
+    runs-on: [self-hosted, pf-builder-vm]
     timeout-minutes: 60
     env:
       SIM_IMG: pocketforge-sim:hwprobe-smoke-${{ github.run_id }}
