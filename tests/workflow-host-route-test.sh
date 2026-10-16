@@ -43,11 +43,22 @@
 #                            before the image operand, including the image slot and
 #                            consumed flag values) word-splits at runtime and can inject
 #                            ANY option (--privileged, --device, binds, env) past the
-#                            static scan -> denied. Quoted expansions ("$SIM_IMG") are
-#                            one word and cannot inject options; unquoted expansions
-#                            AFTER the image operand (the steps.matrix.outputs.*
-#                            device list) are container arguments, inert for Docker
-#                            option parsing. ATTACHED short-option spellings
+#                            static scan -> denied. QUOTED expansions ("$FLAGS",
+#                            "${FLAGS}", "$(route_args)", "`route_args`") do not word-
+#                            split, but the resulting single word can still BE a
+#                            complete Docker option (--privileged, --device=/dev/
+#                            uinput) or an option-shaped image, so every quoted
+#                            expansion in the option region (including the image-slot
+#                            candidate) is denied too. The ONLY exception is the image
+#                            slot carrying a bare "$VAR"/"${VAR}" whose name is in the
+#                            explicit PROVEN_IMAGE_VARS allowlist AND whose every
+#                            assignment in the same file resolves to a safe static
+#                            image-reference-like literal (runner-evaluated github
+#                            run_id/run_number/run_attempt/sha expressions fold to a
+#                            placeholder; anything else in ${{ }} fails closed).
+#                            Expansions AFTER the image operand (the
+#                            steps.matrix.outputs.* device list) are container
+#                            arguments, inert for Docker option parsing. ATTACHED short-option spellings
 #                            (`-v/dev:/dev`, `-eDISPLAY`, pflag-combined
 #                            `-tv/dev:/dev`, `-v=/dev:/dev`) are split and face the
 #                            SAME deny model as the spaced spelling.
@@ -180,6 +191,53 @@ SHORT_BOOL_FLAGS = frozenset(
     f for f in DOCKER_BOOL_FLAGS if len(f) == 2 and not f.startswith("--")
 )
 
+# Quoting prevents word splitting but NOT the single resulting word from being a
+# complete Docker option (`FLAGS=--privileged; docker run "$FLAGS" img` runs
+# privileged) or an option-shaped image. Every quoted expansion in the option
+# region (including the image-slot candidate) therefore fails closed, EXCEPT a
+# bare "$VAR"/"${VAR}" image operand whose name is allowlisted here AND whose
+# every assignment in the same file folds to a safe static image reference.
+PROVEN_IMAGE_VARS = {"SIM_IMG"}
+# Runner-evaluated GitHub contexts proven to render numeric/hex text only.
+SAFE_GH_EXPR = re.compile(
+    r"\$\{\{\s*github\.(?:run_id|run_number|run_attempt|sha)\s*\}\}")
+IMAGE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$")
+SHELL_ASSIGN_RE = re.compile(
+    r"""(?:^|[\s;|&({])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)="""
+    r"""(\"[^\"]*\"|'[^']*'|[^\s;|&]*)""")
+PROVEN_VAR_TOKEN = re.compile(r"^\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)(?:\})?$")
+
+
+def unquote(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def safe_image_value(value):
+    """True when an assigned value can only render as a static image reference:
+    known-safe runner contexts fold to a numeric placeholder and the result is a
+    plain reference (no whitespace, no leading dash, no residual expansion)."""
+    folded = SAFE_GH_EXPR.sub("0", value)
+    return bool(IMAGE_REF_RE.match(folded))
+
+
+def proven_image_vars(text):
+    """Allowlisted image variables whose every assignment in this text folds to
+    a safe static image reference. No assignment, or any unsafe assignment (or
+    unsafe `${{ }}` context), leaves the variable UNPROVEN (fail closed)."""
+    assignments = {}
+    for _lineno, line in logical_lines(text):
+        for m in SHELL_ASSIGN_RE.finditer(line):
+            if m.group(1) in PROVEN_IMAGE_VARS:
+                assignments.setdefault(m.group(1), []).append(unquote(m.group(2)))
+        for name in PROVEN_IMAGE_VARS:
+            m = re.match(r"^\s*-?\s*" + name + r":\s*(.+?)\s*$", line)
+            if m:
+                assignments.setdefault(name, []).append(unquote(m.group(1)))
+    return {name for name, values in assignments.items()
+            if values and all(safe_image_value(v) for v in values)}
+
 
 def logical_lines(text):
     """Yield (start_lineno_1based, joined_line) with backslash continuations joined."""
@@ -196,14 +254,22 @@ def logical_lines(text):
 
 
 def raw_word_flags(line):
-    """One bool per whitespace-separated shell word: True when the word carries a
-    `$` or backtick OUTSIDE any quotes. Unquoted expansions word-split at runtime,
-    so a single token like $FLAGS or $(route_args) can inject WHOLE docker options;
-    quoted expansions ("$IMG") stay one word and cannot. Aligned 1:1 with the
-    shlex.split() tokens of the same line (callers must verify the lengths)."""
+    """One state per whitespace-separated shell word: "unquoted" when the word
+    carries a `$` or backtick OUTSIDE any quotes (word-splits at runtime, so a
+    single token like $FLAGS or $(route_args) can inject WHOLE docker options);
+    "quoted" when it carries expansions only inside double quotes (stays one
+    word, but that word can still evaluate to a complete option or an
+    option-shaped image); else "static" (single-quoted or plain text). Aligned
+    1:1 with the shlex.split() tokens of the same line (callers must verify the
+    lengths)."""
     flags = []
     have_word = False
     unquoted_dyn = False
+    quoted_dyn = False
+
+    def state():
+        return "unquoted" if unquoted_dyn else "quoted" if quoted_dyn else "static"
+
     in_single = in_double = esc = False
     for ch in line:
         if esc:
@@ -218,6 +284,8 @@ def raw_word_flags(line):
                 esc = True
             elif ch == '"':
                 in_double = False
+            elif ch in "$`":
+                quoted_dyn = True
             continue
         if ch == "\\":
             esc = True
@@ -232,15 +300,15 @@ def raw_word_flags(line):
             continue
         if ch.isspace():
             if have_word:
-                flags.append(unquoted_dyn)
+                flags.append(state())
             have_word = False
-            unquoted_dyn = False
+            unquoted_dyn = quoted_dyn = False
             continue
         have_word = True
         if ch in "$`":
             unquoted_dyn = True
     if have_word:
-        flags.append(unquoted_dyn)
+        flags.append(state())
     return flags
 
 
@@ -380,6 +448,7 @@ def token_findings(tok, lineno):
 def scan_text(text):
     """Return findings: list of (rule, lineno, detail)."""
     findings = []
+    proven_vars = proven_image_vars(text)
     for lineno, line in logical_lines(text):
         for rule, pat in TEXT_RULES:
             m = pat.search(line)
@@ -441,7 +510,7 @@ def scan_text(text):
                 flag, value = apair
                 findings.extend(token_findings(value, lineno))
                 check_sensitive_value(flag, value, lineno, findings)
-                if not image_seen and raws[i]:
+                if not image_seen and raws[i] == "unquoted":
                     findings.append(("dynamic_route", lineno,
                                      "unquoted expansion attached to "
                                      f"{flag} can word-split into extra docker "
@@ -459,7 +528,7 @@ def scan_text(text):
                         # denials, else `--device /dev/uinput` hides in the value slot.
                         findings.extend(token_findings(value, lineno))
                         check_sensitive_value(flag, value, lineno, findings)
-                        if not image_seen and raws[i + 1]:
+                        if not image_seen and raws[i + 1] == "unquoted":
                             findings.append(("dynamic_route", lineno,
                                              "unquoted expansion as the value of "
                                              f"{tok} can word-split into extra "
@@ -479,24 +548,45 @@ def scan_text(text):
                 # OPTION region. An unquoted expansion here ($FLAGS, ${FLAGS},
                 # $(cmd), `cmd`) word-splits at runtime and can inject ANY option
                 # (--privileged, --device, binds, env) past this static scan.
-                if raws[i]:
+                if raws[i] == "unquoted":
                     findings.append(("dynamic_route", lineno,
                                      "unquoted shell expansion in the docker option "
                                      "region can inject arbitrary options at runtime: "
                                      f"{tok}"))
                 elif tok.startswith("-"):
-                    # Unknown non-boolean flag: its value is the next non-dash word.
-                    if ("=" not in tok and tok not in DOCKER_BOOL_FLAGS
-                            and i + 1 < n and not tokens[i + 1].startswith("-")):
+                    if raws[i] == "quoted":
+                        findings.append(("dynamic_route", lineno,
+                                         "quoted expansion as a docker flag name can "
+                                         "evaluate to an arbitrary option at runtime: "
+                                         f"{tok}"))
+                    elif ("=" not in tok and tok not in DOCKER_BOOL_FLAGS
+                          and i + 1 < n and not tokens[i + 1].startswith("-")):
+                        # Unknown non-boolean flag: its value is the next non-dash
+                        # word. The flag is not in the audited sensitive set, so an
+                        # unresolved value cannot be proven safe -> fail closed.
                         findings.extend(token_findings(tokens[i + 1], lineno))
-                        if raws[i + 1]:
+                        if raws[i + 1] != "static":
                             findings.append(("dynamic_route", lineno,
-                                             "unquoted expansion as the value of "
-                                             f"{tok} can word-split into extra "
-                                             f"docker options: {tokens[i + 1]}"))
+                                             "unresolved expansion as the value of "
+                                             f"unknown docker flag {tok} cannot be "
+                                             f"proven safe: {tokens[i + 1]}"))
                         i += 1
+                elif raws[i] == "quoted":
+                    # Quoting prevents word splitting but NOT the single word from
+                    # evaluating to a complete option (--privileged) or an
+                    # option-shaped image. Only the explicit proven-image-variable
+                    # allowlist passes; everything else fails closed.
+                    m = PROVEN_VAR_TOKEN.match(tok)
+                    if m and m.group(1) in proven_vars:
+                        image_seen = True  # allowlisted, statically assigned image
+                    else:
+                        findings.append(("dynamic_route", lineno,
+                                         "quoted shell expansion in the docker option "
+                                         "region can evaluate to a complete docker "
+                                         "option at runtime (not a proven image "
+                                         f"variable): {tok}"))
                 else:
-                    image_seen = True  # first positional operand = the image
+                    image_seen = True  # first static positional operand = the image
             i += 1
     return findings
 
@@ -739,9 +829,42 @@ SELF_TEST_FIXTURES = [
     ("red_attached_short_env_display_assign",
      "run: docker run --rm -eWAYLAND_DISPLAY=wayland-0 alpine true\n",
      {"host_display_projection"}),
+    # ---- quoted expansions in the option region: quoting prevents word
+    # splitting but NOT the single word from evaluating to a complete option
+    # (--privileged, --device=/dev/uinput) or an option-shaped image.
+    ("red_quoted_scalar_option_region",
+     'run: |\n  FLAGS=--privileged\n  docker run --rm "$FLAGS" pocketforge-sim:x check-control\n',
+     {"dynamic_route"}),
+    ("red_quoted_braced_option_region",
+     'run: docker run --rm "${FLAGS}" pocketforge-sim:x cmd\n',
+     {"dynamic_route"}),
+    ("red_quoted_cmdsub_option_region",
+     'run: docker run --rm "$(route_args)" pocketforge-sim:x cmd\n',
+     {"dynamic_route"}),
+    ("red_quoted_backtick_option_region",
+     'run: docker run --rm "`route_args`" pocketforge-sim:x cmd\n',
+     {"dynamic_route"}),
+    ("red_quoted_image_slot_unproven_var",
+     'run: docker run --rm --network none "$SOME_IMG" check-control a133\n',
+     {"dynamic_route"}),
+    ("red_quoted_image_var_unsafe_value",
+     'run: |\n  SIM_IMG=--device=/dev/uinput\n  docker run --rm "$SIM_IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_quoted_flag_name_option_region",
+     'run: docker run --rm "--$OPT" pocketforge-sim:x cmd\n',
+     {"dynamic_route"}),
+    ("red_image_var_unsafe_gh_context",
+     'env:\n  SIM_IMG: pocketforge-${{ github.event.pull_request.title }}\n'
+     'run: docker run --rm "$SIM_IMG" cmd\n',
+     {"dynamic_route"}),
     # ---- greens
+    ("green_proven_image_variable",
+     'env:\n  SIM_IMG: pocketforge-sim:hwprobe-smoke-${{ github.run_id }}\n'
+     'run: docker run --rm --network none "$SIM_IMG" check-control --only-launcher qemu\n',
+     set()),
     ("green_migrated_argv",
      "run: |\n"
+     "  SIM_IMG=pocketforge-sim:hwprobe-smoke-0\n"
      "  docker run --rm --network none \\\n"
      "    --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
      '    -v "$PWD/build:/pf-hwprobe-build:ro" \\\n'
@@ -753,17 +876,20 @@ SELF_TEST_FIXTURES = [
      "# bound, or module-loaded, and no seat variable is projected (incident tsp-ihne1.56.5).\n",
      set()),
     ("green_caps_helper",
-     'run: caps() { docker run --rm "$SIM_IMG" shell -lc "python3 /opt/pf/platform/core/caps.py $*" 2>/dev/null; }\n',
+     'run: |\n  SIM_IMG=pocketforge-sim:hwprobe-smoke-0\n'
+     '  caps() { docker run --rm "$SIM_IMG" shell -lc "python3 /opt/pf/platform/core/caps.py $*" 2>/dev/null; }\n',
      set()),
     ("green_workspace_chown_reclaim",
      'run: docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true\n',
      set()),
     ("green_workspace_child_binds",
-     'run: docker run --rm --network none -v "$PWD/build:/app-build:ro" '
+     'run: |\n  SIM_IMG=pocketforge-sim:hwprobe-smoke-0\n'
+     '  docker run --rm --network none -v "$PWD/build:/app-build:ro" '
      '-v "$PWD/evidence:/evidence" "$SIM_IMG" shell -lc \'python3 /app-ci/run.py --platform "$PLATFORM"\'\n',
      set()),
     ("green_attached_workspace_bind",
-     'run: docker run --rm "-v$PWD/build:/app-build:ro" "$SIM_IMG" shell -lc "python3 /app-ci/run.py"\n',
+     'run: |\n  SIM_IMG: pocketforge-sim:hwprobe-smoke-7\n'
+     '  docker run --rm "-v$PWD/build:/app-build:ro" "$SIM_IMG" shell -lc "python3 /app-ci/run.py"\n',
      set()),
     ("green_static_benign_bind",
      "run: docker run --rm -v /opt/pf/platform:/platform:ro img cmd\n",
