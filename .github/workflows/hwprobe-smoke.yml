@@ -78,8 +78,10 @@ name: hwprobe-smoke
 #   hwprobe.py's module docstring.
 #
 # SECURITY POSTURE — identical to E5 sim-gate.yml (self-hosted docker with
-# elevated caps for qemu-tsp + uinput + bwrap). The equivalent hardenings
-# apply here:
+# elevated caps for qemu-tsp + bwrap NESTING only; since incident tsp-ihne1.56.5
+# input rides the sim's per-run private FIFOs — NO host kernel input node,
+# device-cgroup widening, /dev/input bind, or seat-variable projection.
+# The equivalent hardenings apply here:
 #   * Least-privilege GITHUB_TOKEN (contents: read).
 #   * --network none on the RUN phase (baked, pinned artifacts).
 #   * MECHANICAL fork guard (tsp-20u1, build-lab confinement invariant): the
@@ -135,11 +137,18 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
-      # uinput note: the nested sim needs the HOST's /dev/uinput (passed into the
-      # container below). The runner user has no modprobe sudo, so a workflow-side
-      # `sudo modprobe uinput` can never work — the module is guaranteed host-side
-      # via /etc/modules-load.d/uinput.conf, provisioned by pocketforge-automation
-      # scripts/provision-build-host.sh (bead tsp-y1c6). No workflow step needed.
+      # NO HOST INPUT ROUTE (incident tsp-ihne1.56.5): the pinned sim's control surface
+      # feeds check-control through per-run private FIFOs created inside the container
+      # (sim control/control_surface.py, FifoSynth), so nothing here opens /dev/uinput,
+      # binds /dev/input, widens the char-major-13 cgroup, loads a host module, or
+      # projects a seat/display variable. tests/workflow-host-route-test.sh below is the
+      # static guard: it re-inspects the full generated docker argv of every workflow
+      # `docker run` and fails CI if a host route ever returns.
+
+      - name: Host-route guard (static argv scan of .github/workflows)
+        run: |
+          bash tests/workflow-host-route-test.sh --self-test
+          bash tests/workflow-host-route-test.sh
 
       - name: Cross-build pf-hwprobe.arm64 (pinned; hermetic docker)
         run: ./build.sh
@@ -182,7 +191,9 @@ jobs:
           # (this image is built from pins.env's pinned sim, which need not carry the new `matrix`
           # entrypoint verb) — so the only dependency is the BAKED PLATFORM carrying caps.py's
           # `matrix` subcommand.
-          caps() { docker run --rm "$SIM_IMG" shell -lc "python3 /opt/pf/platform/core/caps.py $*" 2>/dev/null; }
+          # `--` ends Docker's option parsing, so the dynamic image operand can never be
+          # re-read as an option at runtime (host-route guard delimiter rule, tsp-ihne1.56.5).
+          caps() { docker run --rm -- "$SIM_IMG" shell -lc "python3 /opt/pf/platform/core/caps.py $*" 2>/dev/null; }
           blocking="$(caps matrix list --posture blocking --format ids || true)"
           advisory="$(caps matrix list --posture advisory --format ids || true)"
           excluded="$(caps matrix list --posture excluded --format ids || true)"
@@ -203,17 +214,20 @@ jobs:
 
       # --network none on the RUN: baked, pinned artifacts, no out-of-band input needed.
       # The elevated caps mirror E5 sim-gate.yml — SYS_ADMIN + unconfined apparmor/seccomp
-      # are required by the nested bwrap sandbox + uinput/evdev seam. See docker/README.md
-      # in the sim repo for the tsp-qc1.2 verdict on the required cap set.
+      # are required by the nested bwrap sandbox (namespaces + mount/pivot_root) ONLY.
+      # Input reaches check-control through the sim's per-run private FIFO control surface
+      # (sim control/control_surface.py); no host device node, cgroup rule or bind is
+      # passed (incident tsp-ihne1.56.5; guarded by tests/workflow-host-route-test.sh).
+      # `--` before the image ends Docker's option parsing, so the dynamic image operand
+      # can never be re-read as an option at runtime (guard delimiter rule, tsp-ihne1.56.5).
       - name: check-control (BLOCKING devices; pf-hwprobe.arm64, qemu launcher only)
         if: steps.matrix.outputs.blocking != ''
         run: |
           docker run --rm --network none \
-            --device /dev/uinput --device-cgroup-rule "c 13:* rmw" -v /dev/input:/dev/input \
             --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
             -v "$PWD/build:/pf-hwprobe-build:ro" \
             -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \
-            "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.blocking }}
+            -- "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.blocking }}
 
       # ADVISORY devices report but do not fail the required check (infra-113 D2 — a523 rides as
       # device-free data, not a hardware gate). A failure here is surfaced loudly, never silenced.
@@ -221,11 +235,10 @@ jobs:
         if: steps.matrix.outputs.advisory != ''
         run: |
           if docker run --rm --network none \
-            --device /dev/uinput --device-cgroup-rule "c 13:* rmw" -v /dev/input:/dev/input \
             --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
             -v "$PWD/build:/pf-hwprobe-build:ro" \
             -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \
-            "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.advisory }}; then
+            -- "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.advisory }}; then
             echo "✓ advisory devices passed: ${{ steps.matrix.outputs.advisory }}"
           else
             echo "::warning title=advisory sim smoke failed::advisory devices FAILED (reported, non-blocking): ${{ steps.matrix.outputs.advisory }}"
