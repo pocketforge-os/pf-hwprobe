@@ -47,7 +47,10 @@
 #                            one word and cannot inject options; unquoted expansions
 #                            AFTER the image operand (the steps.matrix.outputs.*
 #                            device list) are container arguments, inert for Docker
-#                            option parsing.
+#                            option parsing. ATTACHED short-option spellings
+#                            (`-v/dev:/dev`, `-eDISPLAY`, pflag-combined
+#                            `-tv/dev:/dev`, `-v=/dev:/dev`) are split and face the
+#                            SAME deny model as the spaced spelling.
 #   unparseable_command      a docker command the tokenizer cannot split, or whose shell
 #                            word walk and shlex tokenization disagree (fail closed)
 # Full mode additionally asserts the POSITIVE controls on hwprobe-smoke.yml: the smoke gate
@@ -108,6 +111,9 @@ SENSITIVE_VALUE_FLAGS = {
     "-v", "--volume", "--mount", "-e", "--env",
 }
 BIND_FLAGS = {"-v", "--volume", "--mount"}
+# Docker short options accept ATTACHED values (`-v/dev:/dev` == `-v /dev:/dev`,
+# `-eDISPLAY` == `-e DISPLAY`). They must be split before the deny model runs.
+SHORT_VALUE_FLAGS = ("-v", "-e")
 WORKSPACE_PREFIXES = ("$PWD/", "${PWD}/")
 WORKSPACE_EXACT = ("$PWD", "${PWD}")
 ARRAY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\[[@*]\]\}")
@@ -167,6 +173,12 @@ DOCKER_BOOL_FLAGS = {
     "--interactive", "-i", "--tty", "-t", "-it", "--publish-all", "-P",
     "--no-healthcheck", "--sig-proxy",
 }
+
+# Single-char boolean shorthands pflag may combine ahead of an attached value
+# (`-tv/dev:/dev` == `-t -v /dev:/dev`).
+SHORT_BOOL_FLAGS = frozenset(
+    f for f in DOCKER_BOOL_FLAGS if len(f) == 2 and not f.startswith("--")
+)
 
 
 def logical_lines(text):
@@ -232,6 +244,29 @@ def raw_word_flags(line):
     return flags
 
 
+def attached_short_pair(tok):
+    """Split docker's attached-value short-option spelling into (flag, value);
+    None when tok is not one. `-v/dev:/dev` -> ("-v", "/dev:/dev"); pflag also
+    accepts `-v=/dev:/dev` and combined shorthands (`-tv/dev:/dev`)."""
+    if not tok.startswith("-") or tok.startswith("--"):
+        return None
+    body = tok[1:]
+    while body:
+        flag = "-" + body[0]
+        if flag in SHORT_VALUE_FLAGS:
+            if len(body) < 2:
+                return None
+            value = body[1:]
+            if value.startswith("="):
+                value = value[1:]
+            return flag, value
+        if flag in SHORT_BOOL_FLAGS:
+            body = body[1:]
+            continue
+        return None
+    return None
+
+
 def docker_regions(tokens):
     """Split one `docker run` token list into (option_tokens, image_idx, app_tokens).
     The image is the first positional operand after `docker run`; everything after it
@@ -246,8 +281,8 @@ def docker_regions(tokens):
     while i < n:
         tok = tokens[i]
         if tok.startswith("-"):
-            if tok in DOCKER_BOOL_FLAGS or "=" in tok:
-                i += 1
+            if tok in DOCKER_BOOL_FLAGS or "=" in tok or attached_short_pair(tok):
+                i += 1  # self-contained (boolean, inline `=`, or attached value)
             elif i + 1 < n and not tokens[i + 1].startswith("-"):
                 i += 2  # flag value (sensitive or unknown)
             else:
@@ -399,6 +434,20 @@ def scan_text(text):
                 findings.append(("host_device_wildcard", lineno, tok))
             if tok == "--env-file" or tok.startswith("--env-file="):
                 findings.append(("host_env_file", lineno, tok))
+            apair = attached_short_pair(tok)
+            if apair is not None:
+                # Attached short-option spelling (`-v/dev:/dev`, `-eDISPLAY`):
+                # split, then run the SAME deny model as the spaced spelling.
+                flag, value = apair
+                findings.extend(token_findings(value, lineno))
+                check_sensitive_value(flag, value, lineno, findings)
+                if not image_seen and raws[i]:
+                    findings.append(("dynamic_route", lineno,
+                                     "unquoted expansion attached to "
+                                     f"{flag} can word-split into extra docker "
+                                     f"options: {tok}"))
+                i += 1
+                continue
             consumed = False
             for flag in SENSITIVE_VALUE_FLAGS:
                 if tok == flag:
@@ -673,6 +722,23 @@ SELF_TEST_FIXTURES = [
     ("red_unquoted_expansion_as_unknown_flag_value",
      'run: docker run --rm --security-opt $OPT "$IMG" cmd\n',
      {"dynamic_route"}),
+    # ---- attached-value short-option reds: docker accepts `-vVALUE` / `-eVALUE`
+    # as equivalent to the spaced spelling; they must face the same deny model.
+    ("red_attached_short_bind_parent_dev",
+     "run: docker run --rm -v/dev:/dev alpine true\n",
+     {"host_path_bind"}),
+    ("red_attached_short_bind_run_user",
+     "run: docker run --rm -v/run/user/1000:/run/user/1000 alpine true\n",
+     {"host_path_bind"}),
+    ("red_attached_short_bind_combined_bools",
+     "run: docker run -it -tv/tmp:/tmp alpine true\n",
+     {"host_path_bind"}),
+    ("red_attached_short_env_display_passthrough",
+     "run: docker run --rm -eDISPLAY alpine true\n",
+     {"host_display_projection"}),
+    ("red_attached_short_env_display_assign",
+     "run: docker run --rm -eWAYLAND_DISPLAY=wayland-0 alpine true\n",
+     {"host_display_projection"}),
     # ---- greens
     ("green_migrated_argv",
      "run: |\n"
@@ -695,6 +761,9 @@ SELF_TEST_FIXTURES = [
     ("green_workspace_child_binds",
      'run: docker run --rm --network none -v "$PWD/build:/app-build:ro" '
      '-v "$PWD/evidence:/evidence" "$SIM_IMG" shell -lc \'python3 /app-ci/run.py --platform "$PLATFORM"\'\n',
+     set()),
+    ("green_attached_workspace_bind",
+     'run: docker run --rm "-v$PWD/build:/app-build:ro" "$SIM_IMG" shell -lc "python3 /app-ci/run.py"\n',
      set()),
     ("green_static_benign_bind",
      "run: docker run --rm -v /opt/pf/platform:/platform:ro img cmd\n",
