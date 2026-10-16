@@ -24,14 +24,28 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
+# Container bind sources must be anchored at the runner workspace root (canonical
+# host-route policy, tests/fixtures/host-route-policy-v1.json): on GitHub runners
+# GITHUB_WORKSPACE is the checkout; local dev runs fall back to the repo root, so
+# the anchored bind literals below behave identically in both.
+: "${GITHUB_WORKSPACE:=$HERE}"
+
 # shellcheck disable=SC1091
 source "$HERE/pins.env"
 
-CACHE_DIR="${CACHE_DIR:-$HERE/.cache}"
-BUILD_DIR="${BUILD_DIR:-$HERE/build}"
+CACHE_DIR="${CACHE_DIR:-${GITHUB_WORKSPACE}/.cache}"
+BUILD_DIR="${BUILD_DIR:-${GITHUB_WORKSPACE}/build}"
 DEPS_DIR="$BUILD_DIR/deps"
 RUNTIME_SRC="$CACHE_DIR/runtime"
 SIM_SRC="$CACHE_DIR/sim"
+
+# The docker steps bind the literal ${GITHUB_WORKSPACE}/... paths below; an
+# override that resolves elsewhere cannot be expressed as an anchored bind, so
+# fail loudly here instead of silently diverging from the host-side paths.
+if [ "$CACHE_DIR" != "${GITHUB_WORKSPACE}/.cache" ] || [ "$BUILD_DIR" != "${GITHUB_WORKSPACE}/build" ]; then
+    printf 'build.sh: CACHE_DIR/BUILD_DIR must resolve to ${GITHUB_WORKSPACE}/.cache and ${GITHUB_WORKSPACE}/build (host-route policy: container bind sources are workspace-anchored)\n' >&2
+    exit 2
+fi
 
 force_refetch=0
 for arg in "$@"; do
@@ -76,8 +90,8 @@ if [ ! -f "$LIBPF_A" ] || [ "$force_refetch" = 1 ]; then
     # rmdir on stale root-owned deps, bead tsp-u3e4). Hand ownership back before
     # the container exits so ./build.sh never leaves files its caller can't delete.
     docker run --rm \
-        -v "$RUNTIME_SRC":/src:ro \
-        -v "$DEPS_DIR":/out \
+        -v "${GITHUB_WORKSPACE}/.cache/runtime":/src:ro \
+        -v "${GITHUB_WORKSPACE}/build/deps":/out \
         -e CARGO_HOME=/tmp/cargo \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         "$RUST_IMAGE" bash -euxc '
@@ -114,8 +128,8 @@ if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
     # Same ownership hand-back as the rust container above (bead tsp-u3e4):
     # /out is a host bind mount and this container runs as root.
     docker run --rm \
-        -v "$SIM_SRC":/sim:ro \
-        -v "$DEPS_DIR":/out \
+        -v "${GITHUB_WORKSPACE}/.cache/sim":/sim:ro \
+        -v "${GITHUB_WORKSPACE}/build/deps":/out \
         -w /work \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         debian:bookworm bash -euxc '
@@ -153,11 +167,11 @@ else
     # such file or directory`) the first time checkout ever got past the
     # workdir wedge. Same hermetic pattern as steps 2/3, same live-bookworm
     # apt caveat, same ownership hand-back so nothing root-owned lands in the
-    # workdir. The double mount keeps an overridden BUILD_DIR working: the
-    # container always sees the build tree at /work/build.
+    # workdir. Both mounts are workspace-anchored literals (host-route policy);
+    # the container always sees the build tree at /work/build.
     docker run --rm \
-        -v "$HERE":/work -w /work \
-        -v "$BUILD_DIR":/work/build \
+        -v "${GITHUB_WORKSPACE}:/work" -w /work \
+        -v "${GITHUB_WORKSPACE}/build:/work/build" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         debian:bookworm bash -euxc '
             apt-get update -qq

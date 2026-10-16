@@ -1,0 +1,10 @@
+# uinput/host-route occurrence inventory — tsp-ihne1.56.5 (wave 1 + canonical port).
+# Regenerate rows with:
+#   python3 tests/uinput_inventory.py --emit            (creator occurrences)
+#   python3 tests/uinput_inventory.py --emit-host-routes (host-route findings)
+# Row format: <path>\t<sha256-of-stripped-line>\t# justification (class=, note words)
+# pf-hwprobe never opens /dev/uinput, binds /dev/input, or projects host
+# display/clipboard variables: the sim input rides per-run private FIFOs
+# (sim control/control_surface.py, FifoSynth; incident tsp-ihne1.56.5).
+# The literals below are guard detection data (scanner patterns, doc comments,
+# self-test fixtures), never executed against a host.

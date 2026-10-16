@@ -35,7 +35,7 @@
 #                            --mount, -e/--env), a dynamic modprobe/sg/permission-command
 #                            argument, when the runtime value cannot be proven safe. The
 #                            only dynamic bind source allowed is the workspace itself
-#                            ($PWD / ${PWD}, exact or as a path prefix). shlex does NOT
+#                            (anchored at a runner workspace root: $GITHUB_WORKSPACE / ${GITHUB_WORKSPACE} / $RUNNER_TEMP / ${RUNNER_TEMP} / ${{ github.workspace }} / ${{ runner.temp }}, exact or as a path prefix; $PWD and $HOME are NOT workspace anchors). shlex does NOT
 #                            expand variables, so `node=/dev/uinput; docker run --device
 #                            "$node"` is invisible to a literal scan — hence this rule.
 #                            WHOLE-ARGV expansions: an UNQUOTED $VAR, ${VAR}, $(cmd) or
@@ -72,7 +72,7 @@
 # by their steps.matrix.outputs.{blocking,advisory} device-list argument). Each requirement
 # is validated IN THE ARGV REGION WHERE ITS CONSUMER INTERPRETS IT: `--cap-add SYS_ADMIN`,
 # `--network none`, the exact `-e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64`, the exact
-# read-only `-v $PWD/build:/pf-hwprobe-build:ro` and `--rm` must be Docker OPTIONS before
+# read-only `-v $GITHUB_WORKSPACE/build:/pf-hwprobe-build:ro` and `--rm` must be Docker OPTIONS before
 # the image operand (the same strings appended after the image are inert application
 # arguments and do NOT satisfy the control), and `--only-launcher qemu` must be a pair
 # AFTER check-control in the container-argument region. Migration must not delete or
@@ -128,8 +128,19 @@ BIND_FLAGS = {"-v", "--volume", "--mount"}
 # Docker short options accept ATTACHED values (`-v/dev:/dev` == `-v /dev:/dev`,
 # `-eDISPLAY` == `-e DISPLAY`). They must be split before the deny model runs.
 SHORT_VALUE_FLAGS = ("-v", "-e")
-WORKSPACE_PREFIXES = ("$PWD/", "${PWD}/")
-WORKSPACE_EXACT = ("$PWD", "${PWD}")
+# Amended canonical policy (runtime host-route-policy v1, input-coord 2026-10-16):
+# a dynamic bind source is allowed only when anchored at a runner workspace root.
+# $PWD, $HOME, unanchored variables and whole-argv expansions stay red.
+WORKSPACE_PREFIXES = (
+    "$GITHUB_WORKSPACE/", "${GITHUB_WORKSPACE}/",
+    "$RUNNER_TEMP/", "${RUNNER_TEMP}/",
+    "${{ github.workspace }}/", "${{ runner.temp }}/",
+)
+WORKSPACE_EXACT = (
+    "$GITHUB_WORKSPACE", "${GITHUB_WORKSPACE}",
+    "$RUNNER_TEMP", "${RUNNER_TEMP}",
+    "${{ github.workspace }}", "${{ runner.temp }}",
+)
 ARRAY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\[[@*]\]\}")
 DYNAMIC = re.compile(r"[$`]")
 
@@ -596,7 +607,7 @@ def pair_ok(tokens, flag, value):
 BLOCKING_RE = re.compile(r"steps\.matrix\.outputs\.blocking")
 ADVISORY_RE = re.compile(r"steps\.matrix\.outputs\.advisory")
 APP_ARM64_ENV = "APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64"
-BUILD_BIND = "$PWD/build:/pf-hwprobe-build:ro"
+BUILD_BIND = "$GITHUB_WORKSPACE/build:/pf-hwprobe-build:ro"
 
 
 def positive_controls_hwprobe(text):
@@ -895,7 +906,7 @@ SELF_TEST_FIXTURES = [
      "  SIM_IMG=pocketforge-sim:hwprobe-smoke-0\n"
      "  docker run --rm --network none \\\n"
      "    --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
-     '    -v "$PWD/build:/pf-hwprobe-build:ro" \\\n'
+     '    -v "$GITHUB_WORKSPACE/build:/pf-hwprobe-build:ro" \\\n'
      "    -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \\\n"
      '    -- "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe $BLOCKING\n',
      set()),
@@ -908,16 +919,16 @@ SELF_TEST_FIXTURES = [
      '  caps() { docker run --rm -- "$SIM_IMG" shell -lc "python3 /opt/pf/platform/core/caps.py $*" 2>/dev/null; }\n',
      set()),
     ("green_workspace_chown_reclaim",
-     'run: docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true\n',
+     'run: docker run --rm -v "$GITHUB_WORKSPACE:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true\n',
      set()),
     ("green_workspace_child_binds",
      'run: |\n  SIM_IMG=pocketforge-sim:hwprobe-smoke-0\n'
-     '  docker run --rm --network none -v "$PWD/build:/app-build:ro" '
-     '-v "$PWD/evidence:/evidence" -- "$SIM_IMG" shell -lc \'python3 /app-ci/run.py --platform "$PLATFORM"\'\n',
+     '  docker run --rm --network none -v "$GITHUB_WORKSPACE/build:/app-build:ro" '
+     '-v "$GITHUB_WORKSPACE/evidence:/evidence" -- "$SIM_IMG" shell -lc \'python3 /app-ci/run.py --platform "$PLATFORM"\'\n',
      set()),
     ("green_attached_workspace_bind",
      'run: |\n  SIM_IMG: pocketforge-sim:hwprobe-smoke-7\n'
-     '  docker run --rm "-v$PWD/build:/app-build:ro" -- "$SIM_IMG" shell -lc "python3 /app-ci/run.py"\n',
+     '  docker run --rm "-v$GITHUB_WORKSPACE/build:/app-build:ro" -- "$SIM_IMG" shell -lc "python3 /app-ci/run.py"\n',
      set()),
     ("green_static_benign_bind",
      "run: docker run --rm -v /opt/pf/platform:/platform:ro img cmd\n",
@@ -925,6 +936,16 @@ SELF_TEST_FIXTURES = [
     ("green_cgroup_benign_rule",
      'run: docker run --rm --device-cgroup-rule "c 1:3 rw" img cmd\n',
      set()),
+    # $PWD/$HOME bind sources: under the amended canonical policy a dynamic bind
+    # source must be anchored at a runner workspace root ($GITHUB_WORKSPACE,
+    # ${GITHUB_WORKSPACE}, $RUNNER_TEMP, ${RUNNER_TEMP}, ${{ github.workspace }},
+    # ${{ runner.temp }}); $PWD and $HOME stay red.
+    ("red_pwd_bind_not_workspace_anchored",
+     'run: docker run --rm -v "$PWD/build:/app-build:ro" -- "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
+    ("red_home_bind_not_workspace_anchored",
+     'run: docker run --rm -v "$HOME/cache:/cache" -- "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
 ]
 
 
@@ -932,7 +953,7 @@ def _run_block(devices_expr):
     return (
         "  docker run --rm --network none \\\n"
         "    --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
-        '    -v "$PWD/build:/pf-hwprobe-build:ro" \\\n'
+        '    -v "$GITHUB_WORKSPACE/build:/pf-hwprobe-build:ro" \\\n'
         "    -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \\\n"
         '    -- "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe '
         + devices_expr + "\n"
@@ -968,7 +989,7 @@ CONTROL_FIXTURES = [
      True),
     # Build bind present but NOT read-only (the `:ro` suffix was the enumerated defect).
     ("ctrl_red_bind_not_readonly",
-     CONTROL_GREEN_TEXT.replace(BUILD_BIND, "$PWD/build:/pf-hwprobe-build"),
+     CONTROL_GREEN_TEXT.replace(BUILD_BIND, "$GITHUB_WORKSPACE/build:/pf-hwprobe-build"),
      True),
     # --only-launcher NOT paired with qemu; a free `qemu` token rides along.
     ("ctrl_red_launcher_unpaired",
