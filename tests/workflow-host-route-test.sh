@@ -38,14 +38,28 @@
 #                            ($PWD / ${PWD}, exact or as a path prefix). shlex does NOT
 #                            expand variables, so `node=/dev/uinput; docker run --device
 #                            "$node"` is invisible to a literal scan — hence this rule.
-#   unparseable_command      a docker command the tokenizer cannot split (fail closed)
+#                            WHOLE-ARGV expansions: an UNQUOTED $VAR, ${VAR}, $(cmd) or
+#                            `cmd` word anywhere in the Docker OPTION region (any token
+#                            before the image operand, including the image slot and
+#                            consumed flag values) word-splits at runtime and can inject
+#                            ANY option (--privileged, --device, binds, env) past the
+#                            static scan -> denied. Quoted expansions ("$SIM_IMG") are
+#                            one word and cannot inject options; unquoted expansions
+#                            AFTER the image operand (the steps.matrix.outputs.*
+#                            device list) are container arguments, inert for Docker
+#                            option parsing.
+#   unparseable_command      a docker command the tokenizer cannot split, or whose shell
+#                            word walk and shlex tokenization disagree (fail closed)
 # Full mode additionally asserts the POSITIVE controls on hwprobe-smoke.yml: the smoke gate
 # still runs — EXACTLY one BLOCKING and one ADVISORY check-control `docker run` (classified
-# by their steps.matrix.outputs.{blocking,advisory} device-list argument), each carrying
-# `--cap-add SYS_ADMIN`, `--network none`, `-e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64`,
-# the read-only bind `-v $PWD/build:/pf-hwprobe-build:ro` and `--only-launcher qemu` as
-# OPTION/VALUE PAIRS (adjacency-parsed, not free token presence), plus --rm. Migration must
-# not delete or degrade the suite.
+# by their steps.matrix.outputs.{blocking,advisory} device-list argument). Each requirement
+# is validated IN THE ARGV REGION WHERE ITS CONSUMER INTERPRETS IT: `--cap-add SYS_ADMIN`,
+# `--network none`, the exact `-e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64`, the exact
+# read-only `-v $PWD/build:/pf-hwprobe-build:ro` and `--rm` must be Docker OPTIONS before
+# the image operand (the same strings appended after the image are inert application
+# arguments and do NOT satisfy the control), and `--only-launcher qemu` must be a pair
+# AFTER check-control in the container-argument region. Migration must not delete or
+# degrade the suite.
 #
 # Usage:
 #   tests/workflow-host-route-test.sh --self-test   # seeded reds + greens, one invocation
@@ -145,6 +159,15 @@ OWNERSHIP_IDIOMS = (
 
 DOCKER_RUN = re.compile(r"\bdocker\s+run\b")
 
+# Docker flags that never take a value. Any OTHER unknown `-flag` consumes the
+# following non-dash word as its value (fail closed: a mis-parsed value could
+# otherwise be mistaken for the image operand and end option parsing too early).
+DOCKER_BOOL_FLAGS = {
+    "--rm", "--privileged", "--init", "--read-only", "--detach", "-d",
+    "--interactive", "-i", "--tty", "-t", "-it", "--publish-all", "-P",
+    "--no-healthcheck", "--sig-proxy",
+}
+
 
 def logical_lines(text):
     """Yield (start_lineno_1based, joined_line) with backslash continuations joined."""
@@ -158,6 +181,80 @@ def logical_lines(text):
             i += 1
         yield start, joined
         i += 1
+
+
+def raw_word_flags(line):
+    """One bool per whitespace-separated shell word: True when the word carries a
+    `$` or backtick OUTSIDE any quotes. Unquoted expansions word-split at runtime,
+    so a single token like $FLAGS or $(route_args) can inject WHOLE docker options;
+    quoted expansions ("$IMG") stay one word and cannot. Aligned 1:1 with the
+    shlex.split() tokens of the same line (callers must verify the lengths)."""
+    flags = []
+    have_word = False
+    unquoted_dyn = False
+    in_single = in_double = esc = False
+    for ch in line:
+        if esc:
+            esc = False
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            if ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_double = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == "'":
+            have_word = True
+            in_single = True
+            continue
+        if ch == '"':
+            have_word = True
+            in_double = True
+            continue
+        if ch.isspace():
+            if have_word:
+                flags.append(unquoted_dyn)
+            have_word = False
+            unquoted_dyn = False
+            continue
+        have_word = True
+        if ch in "$`":
+            unquoted_dyn = True
+    if have_word:
+        flags.append(unquoted_dyn)
+    return flags
+
+
+def docker_regions(tokens):
+    """Split one `docker run` token list into (option_tokens, image_idx, app_tokens).
+    The image is the first positional operand after `docker run`; everything after it
+    is the container command + arguments (inert as far as Docker option parsing goes).
+    image_idx is None when no positional operand exists."""
+    try:
+        start = tokens.index("run", tokens.index("docker"))
+    except ValueError:
+        return tokens, None, []
+    i = start + 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.startswith("-"):
+            if tok in DOCKER_BOOL_FLAGS or "=" in tok:
+                i += 1
+            elif i + 1 < n and not tokens[i + 1].startswith("-"):
+                i += 2  # flag value (sensitive or unknown)
+            else:
+                i += 1
+            continue
+        return tokens[:i], i, tokens[i + 1:]
+    return tokens, None, []
 
 
 def bind_source_denied(src):
@@ -275,15 +372,34 @@ def scan_text(text):
         except ValueError as exc:
             findings.append(("unparseable_command", lineno, str(exc)))
             continue
+        raws = raw_word_flags(line)
+        if len(raws) != len(tokens):
+            # The quote-aware word walk and shlex disagree -> the argv cannot be
+            # proven safe statically. Fail closed.
+            findings.append(("unparseable_command", lineno,
+                             "word/token misalignment in docker run line"))
+            continue
+        # The Docker option region starts AFTER the `docker run` tokens; a shell
+        # prefix on the same logical line (`for suite ...; do`, `if`, `caps() {`)
+        # is not part of the argv and must not be mistaken for the image operand.
+        try:
+            run_idx = tokens.index("run", tokens.index("docker"))
+        except ValueError:
+            run_idx = None
         i = 0
         n = len(tokens)
+        image_seen = False
         while i < n:
             tok = tokens[i]
             findings.extend(token_findings(tok, lineno))
+            if run_idx is None or i <= run_idx:
+                i += 1
+                continue
             if tok == "--privileged":
                 findings.append(("host_device_wildcard", lineno, tok))
             if tok == "--env-file" or tok.startswith("--env-file="):
                 findings.append(("host_env_file", lineno, tok))
+            consumed = False
             for flag in SENSITIVE_VALUE_FLAGS:
                 if tok == flag:
                     if i + 1 >= n:
@@ -294,11 +410,44 @@ def scan_text(text):
                         # denials, else `--device /dev/uinput` hides in the value slot.
                         findings.extend(token_findings(value, lineno))
                         check_sensitive_value(flag, value, lineno, findings)
+                        if not image_seen and raws[i + 1]:
+                            findings.append(("dynamic_route", lineno,
+                                             "unquoted expansion as the value of "
+                                             f"{tok} can word-split into extra "
+                                             f"docker options: {value}"))
                         i += 1
+                        consumed = True
                     break
                 if tok.startswith(flag + "="):
                     check_sensitive_value(flag, tok.split("=", 1)[1], lineno, findings)
+                    consumed = True  # inline form carries its own value
                     break
+            if consumed:
+                i += 1
+                continue
+            if not image_seen:
+                # Everything before the first positional operand is the Docker
+                # OPTION region. An unquoted expansion here ($FLAGS, ${FLAGS},
+                # $(cmd), `cmd`) word-splits at runtime and can inject ANY option
+                # (--privileged, --device, binds, env) past this static scan.
+                if raws[i]:
+                    findings.append(("dynamic_route", lineno,
+                                     "unquoted shell expansion in the docker option "
+                                     "region can inject arbitrary options at runtime: "
+                                     f"{tok}"))
+                elif tok.startswith("-"):
+                    # Unknown non-boolean flag: its value is the next non-dash word.
+                    if ("=" not in tok and tok not in DOCKER_BOOL_FLAGS
+                            and i + 1 < n and not tokens[i + 1].startswith("-")):
+                        findings.extend(token_findings(tokens[i + 1], lineno))
+                        if raws[i + 1]:
+                            findings.append(("dynamic_route", lineno,
+                                             "unquoted expansion as the value of "
+                                             f"{tok} can word-split into extra "
+                                             f"docker options: {tokens[i + 1]}"))
+                        i += 1
+                else:
+                    image_seen = True  # first positional operand = the image
             i += 1
     return findings
 
@@ -322,9 +471,13 @@ BUILD_BIND = "$PWD/build:/pf-hwprobe-build:ro"
 
 def positive_controls_hwprobe(text):
     """The migration keeps the smoke gate: EXACTLY one BLOCKING and one ADVISORY
-    check-control `docker run`, each carrying the nesting caps, isolation, env
-    projection, read-only build bind and launcher selection as OPTION/VALUE PAIRS.
-    Returns failure strings."""
+    check-control `docker run`. Each requirement is validated IN THE ARGV REGION
+    WHERE ITS CONSUMER INTERPRETS IT: the five Docker-side requirements (--rm,
+    --network none, --cap-add SYS_ADMIN, the exact -e APP_ARM64 projection, the
+    exact read-only -v build bind) must be option/value pairs BEFORE the image
+    operand — the same strings appended after the image are inert application
+    arguments — and `--only-launcher qemu` must be a pair AFTER the check-control
+    command in the container-argument region. Returns failure strings."""
     problems = []
     blocking_runs = 0
     advisory_runs = 0
@@ -344,23 +497,39 @@ def positive_controls_hwprobe(text):
         else:
             problems.append("positive-control: a check-control run carries neither "
                             "steps.matrix.outputs.blocking nor .advisory (unclassified)")
-        if not pair_ok(tokens, "--cap-add", "SYS_ADMIN"):
+        opts, image_idx, app = docker_regions(tokens)
+        if image_idx is None:
+            problems.append("positive-control: a check-control run has no image "
+                            "operand; the Docker option region cannot be proven")
+            continue
+        if not pair_ok(opts, "--cap-add", "SYS_ADMIN"):
             problems.append("positive-control: a check-control run lost the paired "
-                            "`--cap-add SYS_ADMIN` nesting cap")
-        if not pair_ok(tokens, "--network", "none"):
+                            "`--cap-add SYS_ADMIN` nesting cap as a Docker option "
+                            "before the image")
+        if not pair_ok(opts, "--network", "none"):
             problems.append("positive-control: a check-control run lost the paired "
-                            "`--network none` isolation")
-        if not pair_ok(tokens, "-e", APP_ARM64_ENV):
+                            "`--network none` isolation as a Docker option before "
+                            "the image")
+        if not pair_ok(opts, "-e", APP_ARM64_ENV):
             problems.append("positive-control: a check-control run lost the exact "
-                            f"`-e {APP_ARM64_ENV}` projection")
-        if not pair_ok(tokens, "-v", BUILD_BIND):
+                            f"`-e {APP_ARM64_ENV}` projection as a Docker option "
+                            "before the image")
+        if not pair_ok(opts, "-v", BUILD_BIND):
             problems.append("positive-control: a check-control run lost the exact "
-                            f"read-only bind `-v {BUILD_BIND}`")
-        if not pair_ok(tokens, "--only-launcher", "qemu"):
+                            f"read-only bind `-v {BUILD_BIND}` as a Docker option "
+                            "before the image")
+        if "--rm" not in opts:
+            problems.append("positive-control: a check-control run lost --rm from "
+                            "the Docker option region")
+        if "check-control" not in app:
+            problems.append("positive-control: check-control is not in the "
+                            "container-argument region (it must be the command "
+                            "the image runs)")
+            continue
+        after_cc = app[app.index("check-control"):]
+        if not pair_ok(after_cc, "--only-launcher", "qemu"):
             problems.append("positive-control: a check-control run lost the paired "
-                            "`--only-launcher qemu` selection")
-        if "--rm" not in tokens:
-            problems.append("positive-control: a check-control run lost --rm")
+                            "`--only-launcher qemu` selection after check-control")
     if blocking_runs != 1:
         problems.append(f"positive-control: {blocking_runs} BLOCKING check-control run(s); "
                         "expected exactly 1")
@@ -483,6 +652,27 @@ SELF_TEST_FIXTURES = [
     ("red_dynamic_bind_non_workspace",
      'run: |\n  SRC=/opt/pf\n  docker run --rm -v "$SRC/data:/data" "$IMG" cmd\n',
      {"dynamic_route"}),
+    # ---- whole-argv expansion reds: an UNQUOTED expansion in the Docker option
+    # region word-splits at runtime and can inject any option past the static scan.
+    ("red_scalar_expansion_option_region",
+     'run: |\n  FLAGS=\'--privileged --device /dev/uinput\'\n'
+     '  docker run --rm $FLAGS "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_braced_scalar_expansion_option_region",
+     'run: docker run --rm ${FLAGS} "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_cmdsub_option_region",
+     'run: docker run --rm $(route_args) "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_backtick_option_region",
+     'run: docker run --rm `route_args` "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_unquoted_dynamic_image_slot",
+     "run: docker run --rm $IMG_VAR cmd\n",
+     {"dynamic_route"}),
+    ("red_unquoted_expansion_as_unknown_flag_value",
+     'run: docker run --rm --security-opt $OPT "$IMG" cmd\n',
+     {"dynamic_route"}),
     # ---- greens
     ("green_migrated_argv",
      "run: |\n"
@@ -573,6 +763,39 @@ CONTROL_FIXTURES = [
     # The advisory invocation deleted outright.
     ("ctrl_red_single_run",
      "run: |\n" + _run_block("${{ steps.matrix.outputs.blocking }}"),
+     True),
+    # ---- boundary spoofs: each Docker-side requirement relocated AFTER the image
+    # operand, where it is an inert application argument. Region-blind token
+    # presence would accept every one of these.
+    ("ctrl_red_cap_spoofed_after_image",
+     CONTROL_GREEN_TEXT.replace("--cap-add SYS_ADMIN --security-opt", "--security-opt")
+     .replace("check-control --only-launcher",
+              "check-control --cap-add SYS_ADMIN --only-launcher"),
+     True),
+    ("ctrl_red_network_spoofed_after_image",
+     CONTROL_GREEN_TEXT.replace("--rm --network none", "--rm")
+     .replace("check-control --only-launcher",
+              "check-control --network none --only-launcher"),
+     True),
+    ("ctrl_red_rm_spoofed_after_image",
+     CONTROL_GREEN_TEXT.replace("docker run --rm", "docker run")
+     .replace("check-control --only-launcher", "check-control --rm --only-launcher"),
+     True),
+    ("ctrl_red_env_spoofed_after_image",
+     CONTROL_GREEN_TEXT.replace("    -e " + APP_ARM64_ENV + " \\\n", "")
+     .replace("check-control --only-launcher",
+              "check-control -e " + APP_ARM64_ENV + " --only-launcher"),
+     True),
+    ("ctrl_red_bind_spoofed_after_image",
+     CONTROL_GREEN_TEXT.replace('    -v "' + BUILD_BIND + '" \\\n', "")
+     .replace("check-control --only-launcher",
+              'check-control -v "' + BUILD_BIND + '" --only-launcher'),
+     True),
+    # --only-launcher qemu relocated BEFORE the image: a Docker option region pair
+    # is not the check-control application argument the gate needs.
+    ("ctrl_red_launcher_spoofed_before_image",
+     CONTROL_GREEN_TEXT.replace("--rm --network none", "--rm --network none --only-launcher qemu")
+     .replace("check-control --only-launcher qemu --label", "check-control --label"),
      True),
 ]
 
