@@ -139,16 +139,22 @@ jobs:
 
       # NO HOST INPUT ROUTE (incident tsp-ihne1.56.5): the pinned sim's control surface
       # feeds check-control through per-run private FIFOs created inside the container
-      # (sim control/control_surface.py, FifoSynth), so nothing here opens /dev/uinput,
+      # (sim control/control_surface.py, FifoSynth), so nothing here opens the host uinput node,
       # binds /dev/input, widens the char-major-13 cgroup, loads a host module, or
       # projects a seat/display variable. tests/workflow-host-route-test.sh below is the
       # static guard: it re-inspects the full generated docker argv of every workflow
       # `docker run` and fails CI if a host route ever returns.
 
-      - name: Host-route guard (static argv scan of .github/workflows)
+      - name: Host-route guards (wave-1 argv scan + canonical inventory)
         run: |
+          # Wave-1 argv guard (tsp-ihne1.56.5): static docker-argv scan of .github/workflows.
           bash tests/workflow-host-route-test.sh --self-test
           bash tests/workflow-host-route-test.sh
+          # Canonical host-route inventory port (runtime 9cfba117, tests/fixtures/host-route-policy-v1.SOURCE):
+          # vendored-file integrity, canonical self-test, then the plain tree scan.
+          bash tests/test-vendored-sources.sh
+          python3 tests/uinput_inventory.py --self-test
+          python3 tests/uinput_inventory.py
 
       - name: Cross-build pf-hwprobe.arm64 (pinned; hermetic docker)
         run: ./build.sh
@@ -225,7 +231,7 @@ jobs:
         run: |
           docker run --rm --network none \
             --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
-            -v "$PWD/build:/pf-hwprobe-build:ro" \
+            -v "$GITHUB_WORKSPACE/build:/pf-hwprobe-build:ro" \
             -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \
             -- "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.blocking }}
 
@@ -236,7 +242,7 @@ jobs:
         run: |
           if docker run --rm --network none \
             --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
-            -v "$PWD/build:/pf-hwprobe-build:ro" \
+            -v "$GITHUB_WORKSPACE/build:/pf-hwprobe-build:ro" \
             -e APP_ARM64=/pf-hwprobe-build/pf-hwprobe.arm64 \
             -- "$SIM_IMG" check-control --only-launcher qemu --label pf-hwprobe ${{ steps.matrix.outputs.advisory }}; then
             echo "✓ advisory devices passed: ${{ steps.matrix.outputs.advisory }}"
@@ -258,4 +264,4 @@ jobs:
       - name: Reclaim workspace ownership (prevent runner-workdir wedge)
         if: always()
         run: |
-          docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true
+          docker run --rm -v "$GITHUB_WORKSPACE:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true
