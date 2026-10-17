@@ -84,17 +84,18 @@ clone_pin "$PLATFORM_REPO" "$PLATFORM_COMMIT" "$PLATFORM_SRC" > "$BUILD_DIR/plat
 LIBPF_A="$DEPS_DIR/libpocketforge.a"
 if [ ! -f "$LIBPF_A" ] || [ "$force_refetch" = 1 ]; then
     banner "cross-build libpocketforge.a (aarch64-unknown-linux-gnu, staticlib)"
-    # HOST_UID/HOST_GID + the final chown: the container runs as root (apt/rustup
+    # Ownership hand-back (bead tsp-u3e4): the container runs as root (apt/rustup
     # need it), so anything it writes to /out lands root-owned on the HOST bind
     # mount — which wedged the build-lab runner workdir (actions/checkout EACCES
-    # rmdir on stale root-owned deps, bead tsp-u3e4). Hand ownership back before
-    # the container exits so ./build.sh never leaves files its caller can't delete.
+    # rmdir on stale root-owned deps). The final chown expands $(id -u):$(id -g)
+    # RUNNER-SIDE inside the container script argument; no dynamic docker env
+    # value is passed (the canonical host-route policy fails closed on those),
+    # and `--` ends option parsing before the dynamic "$RUST_IMAGE" operand.
     docker run --rm \
         -v "${GITHUB_WORKSPACE}/.cache/runtime":/src:ro \
         -v "${GITHUB_WORKSPACE}/build/deps":/out \
         -e CARGO_HOME=/tmp/cargo \
-        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-        "$RUST_IMAGE" bash -euxc '
+        -- "$RUST_IMAGE" bash -euxc '
             mkdir -p /work && cp -a /src/. /work/
             cd /work
             apt-get update -qq
@@ -108,7 +109,7 @@ EOF
             cargo build --release -p libpocketforge --target aarch64-unknown-linux-gnu
             cp target/aarch64-unknown-linux-gnu/release/libpocketforge.a /out/libpocketforge.a
             aarch64-linux-gnu-nm --defined-only /out/libpocketforge.a | grep -E "\\bT pf_" | wc -l
-            chown -R "$HOST_UID:$HOST_GID" /out
+            chown -R '"$(id -u):$(id -g)"' /out
         '
     echo "libpocketforge.a: $(file "$LIBPF_A")"
 fi
@@ -131,7 +132,6 @@ if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
         -v "${GITHUB_WORKSPACE}/.cache/sim":/sim:ro \
         -v "${GITHUB_WORKSPACE}/build/deps":/out \
         -w /work \
-        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         debian:bookworm bash -euxc '
             apt-get update -qq
             apt-get install -y -qq --no-install-recommends \
@@ -144,7 +144,7 @@ if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
             cp /work/sdl3-render/arm64/lib/libSDL3.a /out/libSDL3.a
             mkdir -p /out/sdl3-include
             cp -a /work/sdl3-render/arm64/include/. /out/sdl3-include/
-            chown -R "$HOST_UID:$HOST_GID" /out
+            chown -R '"$(id -u):$(id -g)"' /out
         '
     echo "libSDL3.a: $(file "$SDL3_A")"
 fi
@@ -172,7 +172,6 @@ else
     docker run --rm \
         -v "${GITHUB_WORKSPACE}:/work" -w /work \
         -v "${GITHUB_WORKSPACE}/build:/work/build" \
-        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         debian:bookworm bash -euxc '
             apt-get update -qq
             apt-get install -y -qq --no-install-recommends \
@@ -185,7 +184,7 @@ else
             export OUT_DIR=/work/build
             export BIN_NAME=pf-hwprobe.arm64
             make -f Makefile all
-            chown -R "$HOST_UID:$HOST_GID" /work/build
+            chown -R '"$(id -u):$(id -g)"' /work/build
         '
 fi
 file "$BUILD_DIR/pf-hwprobe.arm64"
