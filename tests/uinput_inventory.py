@@ -17,12 +17,15 @@ tests/fixtures/host-route-policy-v1.json and host-route-cases-v1.jsonl plus a
 
 import argparse
 from collections import Counter
+import errno
 import shlex
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 
@@ -38,6 +41,162 @@ MAP_RELPATH = "tests/fixtures/input-runner-host-map-v1.json"
 MAP_SCHEMA_RELPATH = "tests/fixtures/input-runner-host-map-v1.schema.json"
 MAP_SOURCE_RELPATH = "tests/fixtures/input-runner-host-map-v1.SOURCE"
 MANIFEST_RELPATH = "tests/uinput-inventory.txt"
+MAX_REPO_INPUT_BYTES = 4 * 1024 * 1024
+IGNORED_TREE_PARTS = {".git", "vendor", "target", "build"}
+
+
+class RepoInputError(Exception):
+    """A repository path failed the no-follow, regular-file, or size gate."""
+
+    def __init__(self, reason, path, root, detail):
+        self.reason = reason
+        try:
+            self.path = path.relative_to(root).as_posix()
+        except ValueError:
+            self.path = path.as_posix()
+        self.detail = detail
+        super().__init__(f"{reason}: {self.path}: {detail}")
+
+    def render(self):
+        return (f"repo_input=FAIL reason={self.reason} path={self.path} "
+                f"limit_bytes={MAX_REPO_INPUT_BYTES} detail={self.detail!r}")
+
+
+def repo_path_exists(path):
+    """Existence check that observes a symlink itself rather than its target."""
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def repo_input_identity(metadata):
+    """Return fields that must remain stable across a repository-file read."""
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def read_repo_bytes(path, root=None):
+    """Read one bounded regular repository file without following symlinks.
+
+    lstat rejects named symlinks and oversized/special files before open. The
+    O_NOFOLLOW open plus identity and mutation-time checks close the check/open
+    gap and reject in-place rewrites. Reads remain bounded if a regular file
+    grows after the pre-read size check.
+    """
+    root = (ROOT if root is None else root).resolve()
+    try:
+        relative = path.absolute().relative_to(root)
+    except ValueError as exc:
+        raise RepoInputError("repo_input_outside_root", path, root,
+                             "input is outside the repository root") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise RepoInputError("repo_input_outside_root", path, root,
+                             "input path is not a repository-relative file")
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RepoInputError("repo_input_unsupported", path, root,
+                             "O_NOFOLLOW is unavailable")
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    dir_flags = file_flags | getattr(os, "O_DIRECTORY", 0)
+    directory_fds = []
+    try:
+        try:
+            directory_fds.append(os.open(root, dir_flags))
+        except OSError as exc:
+            raise RepoInputError("repo_input_unreadable", path, root,
+                                 f"cannot open repository root: {exc}") from exc
+        for part in relative.parts[:-1]:
+            try:
+                component = os.stat(part, dir_fd=directory_fds[-1],
+                                    follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise RepoInputError("repo_input_missing", path, root,
+                                     f"parent component {part!r} is missing") from exc
+            except OSError as exc:
+                raise RepoInputError("repo_input_unreadable", path, root, str(exc)) from exc
+            if stat.S_ISLNK(component.st_mode):
+                raise RepoInputError("repo_input_symlink", path, root,
+                                     f"parent component {part!r} is a symbolic link")
+            if not stat.S_ISDIR(component.st_mode):
+                raise RepoInputError("repo_input_non_regular", path, root,
+                                     f"parent component {part!r} is not a directory")
+            try:
+                directory_fds.append(os.open(part, dir_flags, dir_fd=directory_fds[-1]))
+            except OSError as exc:
+                reason = "repo_input_symlink" if exc.errno == errno.ELOOP \
+                    else "repo_input_unreadable"
+                raise RepoInputError(reason, path, root, str(exc)) from exc
+
+        name = relative.parts[-1]
+        try:
+            before = os.stat(name, dir_fd=directory_fds[-1], follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise RepoInputError("repo_input_missing", path, root, "file is missing") from exc
+        except OSError as exc:
+            raise RepoInputError("repo_input_unreadable", path, root, str(exc)) from exc
+        if stat.S_ISLNK(before.st_mode):
+            raise RepoInputError("repo_input_symlink", path, root,
+                                 "symbolic links are not permitted")
+        if not stat.S_ISREG(before.st_mode):
+            raise RepoInputError("repo_input_non_regular", path, root,
+                                 "input is not a regular file")
+        if before.st_size > MAX_REPO_INPUT_BYTES:
+            raise RepoInputError("repo_input_oversized", path, root,
+                                 f"size {before.st_size} exceeds the limit")
+        try:
+            descriptor = os.open(name, file_flags, dir_fd=directory_fds[-1])
+        except OSError as exc:
+            reason = "repo_input_symlink" if exc.errno == errno.ELOOP \
+                else "repo_input_unreadable"
+            raise RepoInputError(reason, path, root, str(exc)) from exc
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise RepoInputError("repo_input_non_regular", path, root,
+                                     "opened input is not a regular file")
+            if repo_input_identity(opened) != repo_input_identity(before):
+                raise RepoInputError("repo_input_changed", path, root,
+                                     "input changed between lstat and open")
+            if opened.st_size > MAX_REPO_INPUT_BYTES:
+                raise RepoInputError("repo_input_oversized", path, root,
+                                     f"size {opened.st_size} exceeds the limit")
+            chunks = []
+            remaining = MAX_REPO_INPUT_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            if len(data) > MAX_REPO_INPUT_BYTES:
+                raise RepoInputError("repo_input_oversized", path, root,
+                                     "input grew beyond the limit while reading")
+            after = os.fstat(descriptor)
+            if repo_input_identity(after) != repo_input_identity(opened):
+                raise RepoInputError("repo_input_changed", path, root,
+                                     "input changed while reading")
+            return data
+        finally:
+            os.close(descriptor)
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def read_repo_text(path, root=None):
+    try:
+        return read_repo_bytes(path, root=root).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        actual_root = ROOT if root is None else root
+        raise RepoInputError("repo_input_not_utf8", path, actual_root, str(exc)) from exc
+
+
+def repo_input_finding(exc):
+    return Finding(exc.reason, exc.reason, exc.path, 1, exc.detail)
 
 
 def fingerprint(path, line):
@@ -50,13 +209,22 @@ def tracked(root=None):
     paths = []
     for path in root.rglob("*"):
         rel = path.relative_to(root)
-        if not path.is_file() or any(part in {".git", "vendor", "target", "build"} for part in rel.parts):
+        if any(part in IGNORED_TREE_PARTS for part in rel.parts):
+            continue
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            # Preserve the path so the bounded reader reports a stable failure
+            # if it is a candidate input.
+            paths.append(rel)
+            continue
+        if stat.S_ISDIR(mode):
             continue
         paths.append(rel)
     return sorted(paths)
 
 
-def occurrences(extra=None):
+def occurrences(extra=None, input_failures=None):
     found = []
     for rel in tracked():
         if rel.parts[0] == "vendor" or rel.name in {MANIFEST.name, Path(__file__).name}:
@@ -64,8 +232,10 @@ def occurrences(extra=None):
         if rel.suffix not in SOURCE_SUFFIXES and rel.name != "Makefile":
             continue
         try:
-            lines = (ROOT / rel).read_text(encoding="utf-8").splitlines()
-        except UnicodeDecodeError:
+            lines = read_repo_text(ROOT / rel).splitlines()
+        except RepoInputError as exc:
+            if input_failures is not None:
+                input_failures.append(exc)
             continue
         for number, line in enumerate(lines, 1):
             if PATTERN.search(line):
@@ -78,17 +248,25 @@ def occurrences(extra=None):
 
 def load_manifest(path=None):
     path = MANIFEST if path is None else path
-    return Counter(line.split("\t#", 1)[0] for line in path.read_text().splitlines()
+    return Counter(line.split("\t#", 1)[0] for line in read_repo_text(path).splitlines()
                    if line and not line.startswith("#") and HOST_ROUTE_TAG not in line)
 
 
 def check(extra=None, quiet=False, allowed=None):
-    allowed = load_manifest() if allowed is None else allowed
-    items = occurrences(extra)
+    input_failures = []
+    if allowed is None:
+        try:
+            allowed = load_manifest()
+        except RepoInputError as exc:
+            input_failures.append(exc)
+            allowed = Counter()
+    items = occurrences(extra, input_failures=input_failures)
     live = Counter(item[0] for item in items)
     unclassified = live - allowed
     stale = allowed - live
     if not quiet:
+        for failure in input_failures:
+            print(failure.render(), file=sys.stderr)
         by_key = {}
         for item in items:
             by_key.setdefault(item[0], []).append(item)
@@ -97,7 +275,7 @@ def check(extra=None, quiet=False, allowed=None):
                 print(f"unclassified uinput occurrence: {path}:{number}: {line}", file=sys.stderr)
         for key, count in stale.items():
             print(f"stale uinput inventory entry ({count}): {key}", file=sys.stderr)
-    return not unclassified and not stale
+    return not input_failures and not unclassified and not stale
 
 
 # ---------------------------------------------------------------------------
@@ -858,8 +1036,11 @@ class Policy:
 def load_policy(root, failures):
     path = root / POLICY_RELPATH
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        doc = json.loads(read_repo_text(path, root=root))
+    except RepoInputError as exc:
+        failures.append(repo_input_finding(exc))
+        doc = {}
+    except ValueError as exc:
         failures.append(Finding("-", "policy_mismatch", POLICY_RELPATH, 1, f"unreadable policy: {exc}"))
         doc = {}
     return Policy(doc, failures)
@@ -890,7 +1071,9 @@ SOURCE_SETENV = re.compile(
     r"\bset_var\s*\(\s*\"(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)\"|"
     r"os\.environ\[\s*[\"'](DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)[\"']\s*\]\s*=|"
     r"\bsetenv\s*\(\s*\"(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)\"")
-SKIP_VALUE_FLAGS = {"--env-file", "--label", "-l", "--name", "--user", "-u", "--workdir", "-w",
+# --env-file is deliberately NOT skippable: any --env-file fails closed
+# (#153) because the file can carry DISPLAY/WAYLAND_DISPLAY/XAUTHORITY.
+SKIP_VALUE_FLAGS = {"--label", "-l", "--name", "--user", "-u", "--workdir", "-w",
                     "--entrypoint", "--network", "--pid", "--ipc", "--cpus", "--memory", "-m",
                     "--shm-size", "--tmpfs", "--stop-signal", "--platform", "--pull", "-t", "--tag"}
 # Docker/podman global options (before the subcommand) and run/create option
@@ -910,7 +1093,10 @@ CONTAINER_GLOBAL_BOOL_FLAGS = {"-D", "--debug", "--tls", "--tlsverify"}
 RUN_BOOL_FLAGS = {"--rm", "--init", "-d", "--detach", "-i", "--interactive", "-t", "--tty",
                   "--privileged", "--read-only", "--no-healthcheck", "-P", "--publish-all",
                   "-q", "--quiet", "--sig-proxy", "--oom-kill-disable"}
-RUN_SHORT_BOOL_CHARS = set("itd")
+RUN_SHORT_BOOL_CHARS = set("itdPq")
+# Short options that take a value inside run/create/exec; an attached value
+# (-eDISPLAY=:0, -v/dev/input:/x) decomposes against these (#153).
+SHORT_VALUE_CHARS = set("evuwlpmh")
 RUN_VALUE_FLAGS = (SKIP_VALUE_FLAGS | {
     "--hostname", "-h", "--add-host", "--runtime", "--cap-add", "--cap-drop", "--dns",
     "--dns-option", "--dns-search", "--domainname", "--expose", "--publish", "-p",
@@ -1175,6 +1361,7 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
             continue
         idx += 1
         run_create = False
+        has_image = False
         tainted = False
         # Global options may precede the subcommand (`docker --context ctx run
         # ...`). Known arities are consumed; an unknown global option makes the
@@ -1184,7 +1371,18 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
         # `podman --root /tmp run "$IMAGE"` must still reach the subcommand).
         while idx < n:
             t = toks[idx].text
+            if t == "container":
+                # `docker container run|create|exec ...` spelling (#153).
+                idx += 1
+                continue
             if t in {"run", "create"}:
+                run_create = True
+                has_image = True
+                idx += 1
+                break
+            if t == "exec":
+                # exec has no image operand, but its -e/--env/--env-file
+                # options project the same routes as run's (#153).
                 run_create = True
                 idx += 1
                 break
@@ -1200,16 +1398,17 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                     tainted = True
                     idx += 1
                     if (idx < n and not toks[idx].text.startswith("-")
-                            and toks[idx].text not in {"run", "create"}):
+                            and toks[idx].text not in {"run", "create", "exec", "container"}):
                         idx += 1
                 continue
             break
-        if (tainted and run_create
+        if (tainted and has_image
                 and any(is_dynamic_value(tok.text) for tok in toks[idx:])):
             # Fail closed inside run/create only: a non-run/create subcommand
             # after an unknown global option has no image operand to prove
             # (`podman --root /tmp inspect "$CONTAINER"` is not a route; #147
-            # review round 2 false positive).
+            # review round 2 false positive). exec carries a container name,
+            # not an image, so it is not an operand to prove either (#153).
             findings.append(Finding("dynamic_route", "dynamic_image_operand",
                                     boundary.path, start_line, text))
         seen_image = False
@@ -1230,7 +1429,9 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                 # trusted `--`; assignment folding never proves its runtime
                 # value. With a tainted parse no positional can be proven to be
                 # the image, so scanning continues to the end of the command.
-                if run_create and after_delim is False and is_dynamic_value(t):
+                # exec's first positional is a container name, not an image,
+                # so the operand rule applies to run/create only (#153).
+                if has_image and after_delim is False and is_dynamic_value(t):
                     findings.append(Finding("dynamic_route", "dynamic_image_operand",
                                             boundary.path, start_line, text))
                 if after_delim:
@@ -1249,8 +1450,51 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                                         boundary.path, start_line, text))
                 idx += 1
                 continue
-            flag = t.split("=", 1)[0]
-            inline = t.split("=", 1)[1] if "=" in t else None
+            flag = None
+            inline = None
+            if t == "-":
+                idx += 1
+                continue
+            if t.startswith("--") or not run_create:
+                flag = t.split("=", 1)[0]
+                inline = t.split("=", 1)[1] if "=" in t else None
+            else:
+                # Decompose short-option tokens structurally (#153): inside
+                # run/create/exec a short token is a cluster of boolean chars
+                # that may end in a value char with an attached value
+                # (-it, -eDISPLAY=$DISPLAY, -v/dev/input:/x, -itv/dev/input:/x).
+                # A char that is neither a known boolean nor a known value
+                # short makes the token undecomposable: it could hide an
+                # attached -e/-v route that no taint can catch, because the
+                # value is inside this token rather than a later operand, so
+                # it fails closed instead of being skipped.
+                chars = t[1:]
+                j = 0
+                undecomposable = False
+                while j < len(chars):
+                    ch = chars[j]
+                    if ch in RUN_SHORT_BOOL_CHARS:
+                        j += 1
+                        continue
+                    if ch in SHORT_VALUE_CHARS:
+                        flag = "-" + ch
+                        rest = chars[j + 1:]
+                        if rest.startswith("="):
+                            rest = rest[1:]
+                        inline = rest or None
+                        break
+                    undecomposable = True
+                    break
+                if undecomposable:
+                    findings.append(Finding("dynamic_route", "undecomposable_option",
+                                            boundary.path, start_line, text))
+                    tainted = True
+                    idx += 1
+                    continue
+                if flag is None:
+                    # Pure boolean cluster such as -it or -dit.
+                    idx += 1
+                    continue
 
             def value(max_tokens=1):
                 nonlocal idx, inline
@@ -1270,6 +1514,14 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                 check_volume_value(value(), boundary, findings, start_line, text)
             elif flag == "--mount":
                 check_mount_value(value(), boundary, findings, start_line, text)
+            elif flag == "--env-file":
+                # Fail closed on any --env-file (#153): the file can carry
+                # DISPLAY/WAYLAND_DISPLAY/XAUTHORITY, and a literal repo path
+                # does not make it green — it needs a manifest row like any
+                # other route.
+                findings.append(Finding("host_display_projection", "env_file",
+                                        boundary.path, start_line, text))
+                value()
             elif flag in {"-e", "--env"}:
                 check_env_value(value(), boundary, findings, start_line, text)
             elif flag == "--device-cgroup-rule":
@@ -1284,16 +1536,15 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                                             start_line, text))
             elif run_create and flag in RUN_BOOL_FLAGS:
                 idx += 1
-            elif run_create and (flag in RUN_VALUE_FLAGS or inline is not None):
+            elif run_create and flag in RUN_VALUE_FLAGS:
                 value()
-            elif (run_create and len(flag) > 2 and flag[0] == "-" and flag[1] != "-"
-                    and all(ch in RUN_SHORT_BOOL_CHARS for ch in flag[1:])):
-                # Boolean short-flag cluster such as -it or -dit.
-                idx += 1
             elif run_create:
                 # Unknown option: a text scan cannot prove its arity, so the
                 # rest of the command is parsed untrusted and any dynamic
-                # operand fails closed (#147 review).
+                # operand fails closed (#147 review). The former
+                # `inline is not None` catch-all silently consumed unknown
+                # `--opt=value` forms; they now taint exactly like their split
+                # spelling, so `run --mystery=x -- "$IMAGE"` stays red (#153).
                 tainted = True
                 idx += 1
             elif flag in SKIP_VALUE_FLAGS:
@@ -1779,11 +2030,15 @@ class JobAnalysis:
 def load_host_map(root, failures):
     """Load and validate the vendored runner-host map plus its .SOURCE pin."""
     path = root / MAP_RELPATH
-    if not path.exists():
+    if not repo_path_exists(path):
         failures.append(Finding("dynamic_route", "missing_host_map", MAP_RELPATH, 1,
                                 "input-runner-host-map-v1.json is not vendored"))
         return None
-    raw = path.read_bytes()
+    try:
+        raw = read_repo_bytes(path, root=root)
+    except RepoInputError as exc:
+        failures.append(repo_input_finding(exc))
+        return None
     try:
         doc = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
@@ -1844,22 +2099,29 @@ def load_host_map(root, failures):
             return None
         seen_runners.add(entry["runner"])
     schema_path = root / MAP_SCHEMA_RELPATH
-    if schema_path.exists():
+    if repo_path_exists(schema_path):
         try:
-            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            schema = json.loads(read_repo_text(schema_path, root=root))
             props = schema.get("definitions", {}).get("entry", {}).get("properties", {})
             required = schema.get("definitions", {}).get("entry", {}).get("required", [])
             seat_enum = props.get("seat_policy", {}).get("enum", [])
             if set(required) != set(MAP_ENTRY_REQUIRED) or set(seat_enum) != set(MAP_SEAT_POLICIES):
                 failures.append(Finding("-", "policy_mismatch", MAP_SCHEMA_RELPATH, 1,
                                         "schema diverges from the canonical entry contract"))
+        except RepoInputError as exc:
+            failures.append(repo_input_finding(exc))
         except ValueError as exc:
             failures.append(Finding("dynamic_route", "malformed_host_map", MAP_SCHEMA_RELPATH, 1,
                                     str(exc)))
     source_path = root / MAP_SOURCE_RELPATH
-    if source_path.exists():
+    if repo_path_exists(source_path):
         meta = {}
-        for meta_line in source_path.read_text(encoding="utf-8").splitlines():
+        try:
+            source_text = read_repo_text(source_path, root=root)
+        except RepoInputError as exc:
+            failures.append(repo_input_finding(exc))
+            return None
+        for meta_line in source_text.splitlines():
             meta_line = meta_line.strip()
             if not meta_line or meta_line.startswith("#") or "=" not in meta_line:
                 continue
@@ -2075,7 +2337,15 @@ def _scan_step_container(container, boundary, findings, text_of):
     image = value.get("image")
     options = value.get("options")
     if isinstance(options, YNode) and isinstance(options.value, str):
-        toks = [Tok("docker", options.line)] + lex_tolerant(options.value, options.line)
+        # tsp-ihne1.56.5.2 (launcher#171 review, comment 4301385457): an
+        # options string carries docker-run options for the implicit
+        # container create; parse it in run context. With only `docker`
+        # prepended, every option was consumed as an unknown global option
+        # and route-bearing values (--env-file, --device, --volume,
+        # --mount, --env, --device-cgroup-rule, attached shorts, clusters)
+        # were never checked: a fail-open.
+        toks = ([Tok("docker", options.line), Tok("run", options.line)]
+                + lex_tolerant(options.value, options.line))
         match_container_tokens(toks, boundary, findings, options.line, text_of(options.line))
     volumes = value.get("volumes")
     if isinstance(volumes, YNode) and isinstance(volumes.value, list):
@@ -2126,9 +2396,14 @@ def load_host_manifest(root, policy, failures, file_texts):
     """Parse host-route rows from the shared manifest. Returns allowed keys."""
     path = root / MANIFEST_RELPATH
     allowed = {}
-    if not path.exists():
+    if not repo_path_exists(path):
         return allowed
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    try:
+        manifest_text = read_repo_text(path, root=root)
+    except RepoInputError as exc:
+        failures.append(repo_input_finding(exc))
+        return allowed
+    for line_no, line in enumerate(manifest_text.splitlines(), 1):
         if line.startswith("#") or HOST_ROUTE_TAG not in line:
             continue
         head, _, meta = line.partition("\t# host-route ")
@@ -2173,14 +2448,15 @@ def load_host_manifest(root, policy, failures, file_texts):
         if klass == "guest_internal":
             caller = fields.get("caller", "")
             caller_path = root / caller
-            valid = caller and caller_path.exists() and \
+            valid = caller and repo_path_exists(caller_path) and \
                 any(fnmatch.fnmatch(caller, pat) for pat in policy.guest_entry_points)
             if valid:
                 caller_text = file_texts.get(caller)
                 if caller_text is None:
                     try:
-                        caller_text = caller_path.read_text(encoding="utf-8")
-                    except (OSError, UnicodeDecodeError):
+                        caller_text = read_repo_text(caller_path, root=root)
+                    except RepoInputError as exc:
+                        failures.append(repo_input_finding(exc))
                         caller_text = ""
                 valid = Path(rel_path).name in caller_text
             if not valid:
@@ -2265,15 +2541,15 @@ def scan_host_routes(root, use_manifest=True, quiet=False):
     for rel in tracked(root=root):
         path = root / rel
         try:
-            head = path.open("r", encoding="utf-8", errors="strict").readline()
-        except (OSError, UnicodeDecodeError):
+            text = read_repo_text(path, root=root)
+        except RepoInputError as exc:
+            if rel.suffix in SOURCE_SUFFIXES or rel.name == "Makefile" \
+                    or host_route_file_kind(rel, "") is not None:
+                failures.append(repo_input_finding(exc))
             continue
+        head = text.splitlines(keepends=True)[0] if text else ""
         kind = host_route_file_kind(rel, head)
         if kind is None:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
             continue
         files_scanned += 1
         file_texts[rel.as_posix()] = text
@@ -2367,14 +2643,13 @@ def _manifest_row(entry):
 def replay_case(case, root):
     """Replay one host-route case in a private temporary tree and return the
     (failures, report_lines, stats) of the scan."""
-    import shutil
     with tempfile.TemporaryDirectory(prefix="host-route-case.") as tmp:
         tmp_root = Path(tmp)
         (tmp_root / "tests" / "fixtures").mkdir(parents=True)
         for name in (POLICY_RELPATH, MAP_SCHEMA_RELPATH, MAP_RELPATH):
             src = root / name
-            if src.exists():
-                shutil.copyfile(src, tmp_root / name)
+            if repo_path_exists(src):
+                (tmp_root / name).write_bytes(read_repo_bytes(src, root=root))
         if "map" in case:
             (tmp_root / MAP_RELPATH).write_text(json.dumps(case["map"], indent=2) + "\n",
                                                 encoding="utf-8")
@@ -2388,7 +2663,7 @@ def replay_case(case, root):
         (tmp_root / MANIFEST_RELPATH).write_text("\n".join(rows) + "\n", encoding="utf-8")
         if "map_source" in case:
             meta = dict(case["map_source"])
-            map_bytes = (tmp_root / MAP_RELPATH).read_bytes()
+            map_bytes = read_repo_bytes(tmp_root / MAP_RELPATH, root=tmp_root)
             if meta.get("fixture_sha256") == "auto":
                 meta["fixture_sha256"] = hashlib.sha256(map_bytes).hexdigest()
             lines = [f"{k}={v}" for k, v in sorted(meta.items())]
@@ -2402,11 +2677,16 @@ def run_self_test_cases(root):
     host-route-cases-v1.jsonl in one invocation. Returns True when every
     expectation holds."""
     cases_path = root / CASES_RELPATH
-    if not cases_path.exists():
+    if not repo_path_exists(cases_path):
         print(f"missing {CASES_RELPATH}", file=sys.stderr)
         return False
     cases = []
-    for line in cases_path.read_text(encoding="utf-8").splitlines():
+    try:
+        cases_text = read_repo_text(cases_path, root=root)
+    except RepoInputError as exc:
+        print(exc.render(), file=sys.stderr)
+        return False
+    for line in cases_text.splitlines():
         line = line.strip()
         if line:
             cases.append(json.loads(line))
@@ -2439,14 +2719,75 @@ def run_self_test_cases(root):
     return ok
 
 
+def seed_repo_input_self_test():
+    """Exercise the input gate's three refusals and one positive control."""
+    with tempfile.TemporaryDirectory(prefix="repo-input-self-test.") as tmp:
+        root = Path(tmp)
+        normal = root / "normal.py"
+        normal.write_text("value = 1\n", encoding="utf-8")
+        normal_green = read_repo_text(normal, root=root) == "value = 1\n"
+
+        linked = root / "linked.py"
+        linked.symlink_to("/dev/zero")
+        try:
+            read_repo_text(linked, root=root)
+            symlink_red = False
+        except RepoInputError as exc:
+            symlink_red = exc.reason == "repo_input_symlink"
+
+        oversized = root / "oversized.py"
+        with oversized.open("wb") as stream:
+            stream.truncate(MAX_REPO_INPUT_BYTES + 1)
+        sparse_link = root / "sparse-link.py"
+        sparse_link.symlink_to(oversized.name)
+        try:
+            read_repo_text(sparse_link, root=root)
+            sparse_symlink_red = False
+        except RepoInputError as exc:
+            sparse_symlink_red = exc.reason == "repo_input_symlink"
+        try:
+            read_repo_text(oversized, root=root)
+            oversized_red = False
+        except RepoInputError as exc:
+            oversized_red = exc.reason == "repo_input_oversized"
+
+        fifo_red = True
+        if hasattr(os, "mkfifo"):
+            fifo = root / "blocked.py"
+            os.mkfifo(fifo)
+            try:
+                read_repo_text(fifo, root=root)
+                fifo_red = False
+            except RepoInputError as exc:
+                fifo_red = exc.reason == "repo_input_non_regular"
+
+    print(f"repo_inputs: symlink={'red' if symlink_red else 'BROKEN'} "
+          f"sparse_symlink={'red' if sparse_symlink_red else 'BROKEN'} "
+          f"oversized={'red' if oversized_red else 'BROKEN'} "
+          f"fifo={'red' if fifo_red else 'BROKEN'} "
+          f"normal={'green' if normal_green else 'BROKEN'}")
+    return symlink_red and sparse_symlink_red and oversized_red and fifo_red and normal_green
+
+
 def seed_creator_self_test():
     """Original creator-inventory seeds: every one must stay red."""
     clean_tree = check(quiet=True)
     seeded_violation_red = not check(extra=[("seeded/violation.c",
                                              'fd = open("/dev/uinput", O_WRONLY);')],
                                      quiet=True)
-    first = occurrences()[0]
-    duplicate_live_red = not check(extra=[(first[1], first[3])], quiet=True)
+    live = occurrences()
+    if live:
+        first = live[0]
+        duplicate_live_red = not check(extra=[(first[1], first[3])], quiet=True)
+    else:
+        # A tree with zero live occurrences (a freshly vendored port, say)
+        # still needs the duplicate-live control: synthesize the classified
+        # seeded row it duplicates.
+        seeded = ("seeded/duplicate.c", 'fd = open("/dev/uinput", O_WRONLY);')
+        seeded_allowed = load_manifest()
+        seeded_allowed[fingerprint(*seeded)] += 1
+        duplicate_live_red = not check(extra=[seeded, seeded], quiet=True,
+                                       allowed=seeded_allowed)
     stale_key = "seeded/stale.c\t" + "0" * 64
     allowed = load_manifest()
     allowed[stale_key] += 1
@@ -2485,6 +2826,8 @@ def main(argv=None):
         emit_host_routes(ROOT)
         return 0
     if args.self_test:
+        if not seed_repo_input_self_test():
+            return 2
         clean_tree, seeded_violation_red, duplicate_live_red, stale_manifest_red = \
             seed_creator_self_test()
         creator_ok = (seeded_violation_red and duplicate_live_red and stale_manifest_red
