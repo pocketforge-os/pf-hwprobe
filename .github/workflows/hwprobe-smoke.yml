@@ -150,7 +150,7 @@ jobs:
           # Wave-1 argv guard (tsp-ihne1.56.5): static docker-argv scan of .github/workflows.
           bash tests/workflow-host-route-test.sh --self-test
           bash tests/workflow-host-route-test.sh
-          # Canonical host-route inventory port (runtime 9cfba117, tests/fixtures/host-route-policy-v1.SOURCE):
+          # Canonical host-route inventory port (runtime 75f9081d, tests/fixtures/host-route-policy-v1.SOURCE):
           # vendored-file integrity, canonical self-test, then the plain tree scan.
           bash tests/test-vendored-sources.sh
           python3 tests/uinput_inventory.py --self-test
